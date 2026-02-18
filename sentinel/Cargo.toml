@@ -16,5 +16,3 @@ sentinel_derive = { path = "../sentinel_derive", optional = true, version = "0.1
 default = ["derive"]
 derive = ["sentinel_derive"]
 
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
