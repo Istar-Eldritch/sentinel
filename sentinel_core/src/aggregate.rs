@@ -20,10 +20,6 @@ use epoch_derive::EventData;
 
 use crate::{AssociationTarget, AttributeMatcher, PolicyGraph};
 
-// Used in Phase 3/4 event application
-#[allow(unused_imports)]
-use crate::{Association, ObjectAttribute, PolicyClass, UserAttribute};
-
 /// The well-known fixed UUID for the single policy aggregate.
 ///
 /// All policy commands must target this ID. There is exactly one
@@ -259,10 +255,12 @@ pub enum PolicyCommandError {
 /// let state_store = InMemoryStateStore::<PolicyState>::new();
 /// let aggregate = PolicyAggregate::new(event_store, state_store);
 /// ```
-#[allow(dead_code)]
 pub struct PolicyAggregate<ES, SS> {
-    pub(crate) event_store: ES,
-    pub(crate) state_store: SS,
+    // Fields used by the Aggregate impl in Phase 4.
+    #[allow(dead_code)]
+    event_store: ES,
+    #[allow(dead_code)]
+    state_store: SS,
 }
 
 impl<ES, SS> PolicyAggregate<ES, SS> {
@@ -278,7 +276,7 @@ impl<ES, SS> PolicyAggregate<ES, SS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PolicyView;
+    use crate::{PolicyClass, PolicyView, UserAttribute};
 
     use epoch_mem::{InMemoryEventBus, InMemoryEventStore, InMemoryStateStore};
 
@@ -364,6 +362,23 @@ mod tests {
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let _deserialized: PolicyCommand = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn policy_command_try_from_identity() {
+        let id = Uuid::new_v4();
+        let cmd = PolicyCommand::CreatePolicyClass {
+            id,
+            name: "platform".to_string(),
+        };
+        let result = PolicyCommand::try_from(cmd);
+        assert!(result.is_ok());
+        if let Ok(PolicyCommand::CreatePolicyClass { id: got_id, name }) = result {
+            assert_eq!(got_id, id);
+            assert_eq!(name, "platform");
+        } else {
+            panic!("unexpected variant");
+        }
     }
 
     #[test]
