@@ -123,6 +123,115 @@ pub struct Association {
     pub operations: HashSet<String>,
 }
 
+// --- PolicyView trait and PolicyGraph struct (Phase 3) ---
+
+/// Read-only view into the policy graph for authorization queries.
+///
+/// This trait abstracts the read-access interface used by PEP functions
+/// ([`evaluate`] and [`scope`]) so they can be written generically over
+/// any policy graph implementation. The primary concrete implementation is
+/// [`PolicyGraph`].
+pub trait PolicyView {
+    /// Returns all user attributes whose matcher matches the given subject attributes.
+    ///
+    /// Iterates over every [`UserAttribute`] in the graph and returns those
+    /// where `matcher.matches(subject_attrs)` is `true`.
+    fn matching_uas(&self, subject_attrs: &HashMap<String, String>) -> Vec<&UserAttribute>;
+
+    /// Returns all associations originating from the given user attribute.
+    ///
+    /// Looks up associations by `ua_id` and returns references to all
+    /// matching [`Association`] entries.
+    fn associations_for_ua(&self, ua_id: Uuid) -> Vec<&Association>;
+
+    /// Looks up an object attribute by its unique identifier.
+    ///
+    /// Returns `Some` if an [`ObjectAttribute`] with the given `oa_id`
+    /// exists in the graph, or `None` otherwise.
+    fn get_oa(&self, oa_id: Uuid) -> Option<&ObjectAttribute>;
+
+    /// Returns all object attributes assigned to the given policy class
+    /// that have the specified resource type.
+    ///
+    /// Filters by both the OA→PC assignment and the
+    /// [`ObjectAttribute::resource_type`] field.
+    fn oas_for_pc(&self, pc_id: Uuid, resource_type: &str) -> Vec<&ObjectAttribute>;
+}
+
+/// Concrete in-memory policy graph.
+///
+/// Stores all policy nodes ([`UserAttribute`], [`ObjectAttribute`],
+/// [`PolicyClass`]), associations ([`Association`]), and OA→PC assignments.
+/// Implements [`PolicyView`] for read access and provides mutation methods
+/// for the event-sourcing aggregate applicator.
+///
+/// Use [`PolicyGraph::new()`] to create an empty graph, then populate it
+/// via the mutation methods (`add_ua`, `add_oa`, `add_pc`,
+/// `add_association`, `assign_oa_to_pc`, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyGraph {
+    /// User attribute nodes indexed by ID.
+    pub(crate) user_attributes: HashMap<Uuid, UserAttribute>,
+    /// Object attribute nodes indexed by ID.
+    pub(crate) object_attributes: HashMap<Uuid, ObjectAttribute>,
+    /// Policy class nodes indexed by ID.
+    pub(crate) policy_classes: HashMap<Uuid, PolicyClass>,
+    /// All associations in the graph.
+    pub(crate) associations: Vec<Association>,
+    /// OA→PC assignment edges stored as `(oa_id, pc_id)` pairs.
+    pub(crate) oa_pc_assignments: HashSet<(Uuid, Uuid)>,
+}
+
+impl PolicyGraph {
+    /// Creates a new, empty policy graph.
+    ///
+    /// The returned graph contains no nodes, associations, or assignments.
+    pub fn new() -> Self {
+        Self {
+            user_attributes: HashMap::new(),
+            object_attributes: HashMap::new(),
+            policy_classes: HashMap::new(),
+            associations: Vec::new(),
+            oa_pc_assignments: HashSet::new(),
+        }
+    }
+}
+
+impl Default for PolicyGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PolicyView for PolicyGraph {
+    fn matching_uas(&self, subject_attrs: &HashMap<String, String>) -> Vec<&UserAttribute> {
+        self.user_attributes
+            .values()
+            .filter(|ua| ua.matcher.matches(subject_attrs))
+            .collect()
+    }
+
+    fn associations_for_ua(&self, ua_id: Uuid) -> Vec<&Association> {
+        self.associations
+            .iter()
+            .filter(|a| a.ua_id == ua_id)
+            .collect()
+    }
+
+    fn get_oa(&self, oa_id: Uuid) -> Option<&ObjectAttribute> {
+        self.object_attributes.get(&oa_id)
+    }
+
+    fn oas_for_pc(&self, pc_id: Uuid, resource_type: &str) -> Vec<&ObjectAttribute> {
+        self.oa_pc_assignments
+            .iter()
+            .filter(|(_, pc)| *pc == pc_id)
+            .filter_map(|(oa_id, _)| self.object_attributes.get(oa_id))
+            .filter(|oa| oa.resource_type == resource_type)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +706,71 @@ mod tests {
         assert_eq!(deserialized.ua_id, assoc.ua_id);
         assert_eq!(deserialized.target, assoc.target);
         assert_eq!(deserialized.operations, assoc.operations);
+    }
+
+    // =========================================================
+    // PolicyView trait and PolicyGraph struct tests (Phase 3)
+    // =========================================================
+
+    // --- PolicyGraph::new() tests ---
+
+    #[test]
+    fn policy_graph_new_creates_empty_graph() {
+        let graph = PolicyGraph::new();
+        let subject_attrs = HashMap::new();
+        let matching = graph.matching_uas(&subject_attrs);
+        assert!(matching.is_empty());
+    }
+
+    #[test]
+    fn policy_graph_new_has_no_associations() {
+        let graph = PolicyGraph::new();
+        let ua_id = Uuid::new_v4();
+        let assocs = graph.associations_for_ua(ua_id);
+        assert!(assocs.is_empty());
+    }
+
+    #[test]
+    fn policy_graph_new_get_oa_returns_none() {
+        let graph = PolicyGraph::new();
+        assert!(graph.get_oa(Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn policy_graph_new_oas_for_pc_returns_empty() {
+        let graph = PolicyGraph::new();
+        let pc_id = Uuid::new_v4();
+        let oas = graph.oas_for_pc(pc_id, "job");
+        assert!(oas.is_empty());
+    }
+
+    // --- PolicyGraph derive tests ---
+
+    #[test]
+    fn policy_graph_debug() {
+        let graph = PolicyGraph::new();
+        let debug_str = format!("{:?}", graph);
+        assert!(debug_str.contains("PolicyGraph"));
+    }
+
+    #[test]
+    fn policy_graph_clone() {
+        let graph = PolicyGraph::new();
+        let cloned = graph.clone();
+        assert!(cloned.matching_uas(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn policy_graph_default() {
+        let graph = PolicyGraph::default();
+        assert!(graph.matching_uas(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn policy_graph_serde_roundtrip_empty() {
+        let graph = PolicyGraph::new();
+        let json = serde_json::to_string(&graph).unwrap();
+        let deserialized: PolicyGraph = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.matching_uas(&HashMap::new()).is_empty());
     }
 }
