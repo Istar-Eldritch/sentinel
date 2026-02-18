@@ -6,7 +6,7 @@
 //! This module defines:
 //! - [`PolicyEvent`] — events emitted by policy mutations
 //! - [`PolicyCommand`] — commands that mutate the policy graph
-//! - [`PolicyState`] — the persisted aggregate state wrapping [`PolicyGraph`](crate::PolicyGraph)
+//! - [`PolicyState`] — the persisted aggregate state wrapping [`PolicyGraph`]
 //! - [`PolicyAggregate`] — the event-sourced aggregate handling commands and applying events
 //! - [`PolicyActor`] — credentials carrying the actor ID for audit trails
 
@@ -108,7 +108,7 @@ pub enum PolicyCommand {
 /// Events emitted by the policy aggregate.
 ///
 /// Events mirror commands 1:1 with past-tense naming. Each event carries
-/// exactly the data needed to replay the corresponding [`PolicyGraph`](crate::PolicyGraph)
+/// exactly the data needed to replay the corresponding [`PolicyGraph`]
 /// mutation.
 ///
 /// `PolicyEvent` serves as both the superset event type (`ED` in `Aggregate<ED>`)
@@ -185,7 +185,7 @@ impl TryFrom<&PolicyEvent> for PolicyEvent {
 
 /// The persisted state of the policy aggregate.
 ///
-/// Wraps a [`PolicyGraph`](crate::PolicyGraph) with epoch version tracking.
+/// Wraps a [`PolicyGraph`] with epoch version tracking.
 /// Access `state.graph` directly for PEP evaluation:
 ///
 /// ```ignore
@@ -219,7 +219,7 @@ impl AggregateState for PolicyState {
 /// Error type for [`PolicyAggregate`]'s event application.
 ///
 /// This is an uninhabited enum — the [`EventApplicator::apply`] method
-/// delegates to infallible [`PolicyGraph`](crate::PolicyGraph) mutation
+/// delegates to infallible [`PolicyGraph`] mutation
 /// methods and can never fail.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyApplyError {}
@@ -574,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::useless_conversion)]
     fn policy_command_try_from_identity() {
         let id = Uuid::new_v4();
         let cmd = PolicyCommand::CreatePolicyClass {
