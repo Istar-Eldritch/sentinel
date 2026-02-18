@@ -128,7 +128,7 @@ pub struct Association {
 /// Read-only view into the policy graph for authorization queries.
 ///
 /// This trait abstracts the read-access interface used by PEP functions
-/// ([`evaluate`] and [`scope`]) so they can be written generically over
+/// (`evaluate` and `scope`) so they can be written generically over
 /// any policy graph implementation. The primary concrete implementation is
 /// [`PolicyGraph`].
 pub trait PolicyView {
@@ -231,7 +231,7 @@ impl PolicyGraph {
 
     /// Removes all associations matching the given `ua_id` and `target`.
     ///
-    /// Because [`add_association`] appends without dedup, there may be
+    /// Because [`Self::add_association`] appends without dedup, there may be
     /// multiple matching entries (e.g., from duplicate commands); all are
     /// removed. If no matching association exists, this is a no-op.
     pub fn remove_association(&mut self, ua_id: Uuid, target: &AssociationTarget) {

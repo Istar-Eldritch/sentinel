@@ -9,13 +9,8 @@ license.workspace = true
 categories.workspace = true
 
 [dependencies]
-log = "0.4"
-async-trait = "0.1"
-chrono = { version = "0.4.41", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "1.0"
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
 serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }

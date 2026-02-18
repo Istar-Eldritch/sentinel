@@ -26,7 +26,6 @@ pub mod derive {
     pub use sentinel_derive::*;
 }
 
-/// The prelude module re-exports the most commonly used types.
 pub mod prelude {
     //! Re-exports of the most commonly used sentinel types and traits.
     pub use sentinel_core::*;
