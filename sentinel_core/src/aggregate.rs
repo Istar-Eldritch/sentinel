@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::{Uuid, uuid};
 
@@ -259,7 +260,6 @@ pub enum PolicyCommandError {
 /// let aggregate = PolicyAggregate::new(event_store, state_store);
 /// ```
 pub struct PolicyAggregate<ES, SS> {
-    #[allow(dead_code)]
     event_store: ES,
     state_store: SS,
 }
@@ -346,6 +346,138 @@ where
 
     fn get_state_store(&self) -> SS {
         self.state_store.clone()
+    }
+}
+
+#[async_trait]
+impl<ES, SS> Aggregate<PolicyEvent> for PolicyAggregate<ES, SS>
+where
+    ES: EventStoreBackend<EventType = PolicyEvent> + Send + Sync + Clone + 'static,
+    SS: StateStoreBackend<PolicyState> + Send + Sync + Clone,
+{
+    type CommandData = PolicyCommand;
+    type CommandCredentials = PolicyActor;
+    type Command = PolicyCommand;
+    type AggregateError = PolicyCommandError;
+    type EventStore = ES;
+
+    fn get_event_store(&self) -> ES {
+        self.event_store.clone()
+    }
+
+    async fn handle_command(
+        &self,
+        state: &Option<PolicyState>,
+        command: Command<PolicyCommand, PolicyActor>,
+    ) -> Result<Vec<Event<PolicyEvent>>, PolicyCommandError> {
+        let actor_id = command.credentials.as_ref().map(|a| a.id);
+
+        let event_data = match command.data {
+            PolicyCommand::CreateUserAttribute { id, name, matcher } => {
+                PolicyEvent::UserAttributeCreated { id, name, matcher }
+            }
+            PolicyCommand::CreateObjectAttribute {
+                id,
+                name,
+                resource_type,
+                matcher,
+            } => PolicyEvent::ObjectAttributeCreated {
+                id,
+                name,
+                resource_type,
+                matcher,
+            },
+            PolicyCommand::CreatePolicyClass { id, name } => {
+                PolicyEvent::PolicyClassCreated { id, name }
+            }
+            PolicyCommand::CreateAssociation {
+                ua_id,
+                target,
+                operations,
+            } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::UserAttributeNotFound(ua_id))?
+                    .graph;
+                if !graph.user_attributes.contains_key(&ua_id) {
+                    return Err(PolicyCommandError::UserAttributeNotFound(ua_id));
+                }
+                match &target {
+                    AssociationTarget::ObjectAttribute(oa_id) => {
+                        if !graph.object_attributes.contains_key(oa_id) {
+                            return Err(PolicyCommandError::ObjectAttributeNotFound(*oa_id));
+                        }
+                    }
+                    AssociationTarget::PolicyClass(pc_id) => {
+                        if !graph.policy_classes.contains_key(pc_id) {
+                            return Err(PolicyCommandError::PolicyClassNotFound(*pc_id));
+                        }
+                    }
+                }
+                PolicyEvent::AssociationCreated {
+                    ua_id,
+                    target,
+                    operations,
+                }
+            }
+            PolicyCommand::RemoveAssociation { ua_id, target } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::UserAttributeNotFound(ua_id))?
+                    .graph;
+                if !graph.user_attributes.contains_key(&ua_id) {
+                    return Err(PolicyCommandError::UserAttributeNotFound(ua_id));
+                }
+                match &target {
+                    AssociationTarget::ObjectAttribute(oa_id) => {
+                        if !graph.object_attributes.contains_key(oa_id) {
+                            return Err(PolicyCommandError::ObjectAttributeNotFound(*oa_id));
+                        }
+                    }
+                    AssociationTarget::PolicyClass(pc_id) => {
+                        if !graph.policy_classes.contains_key(pc_id) {
+                            return Err(PolicyCommandError::PolicyClassNotFound(*pc_id));
+                        }
+                    }
+                }
+                PolicyEvent::AssociationRemoved { ua_id, target }
+            }
+            PolicyCommand::AssignOaToPc { oa_id, pc_id } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::ObjectAttributeNotFound(oa_id))?
+                    .graph;
+                if !graph.object_attributes.contains_key(&oa_id) {
+                    return Err(PolicyCommandError::ObjectAttributeNotFound(oa_id));
+                }
+                if !graph.policy_classes.contains_key(&pc_id) {
+                    return Err(PolicyCommandError::PolicyClassNotFound(pc_id));
+                }
+                PolicyEvent::OaAssignedToPc { oa_id, pc_id }
+            }
+            PolicyCommand::UnassignOaFromPc { oa_id, pc_id } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::ObjectAttributeNotFound(oa_id))?
+                    .graph;
+                if !graph.object_attributes.contains_key(&oa_id) {
+                    return Err(PolicyCommandError::ObjectAttributeNotFound(oa_id));
+                }
+                if !graph.policy_classes.contains_key(&pc_id) {
+                    return Err(PolicyCommandError::PolicyClassNotFound(pc_id));
+                }
+                PolicyEvent::OaUnassignedFromPc { oa_id, pc_id }
+            }
+        };
+
+        let mut builder = event_data.into_builder().stream_id(POLICY_AGGREGATE_ID);
+
+        if let Some(id) = actor_id {
+            builder = builder.actor_id(id);
+        }
+
+        let event = builder.build()?;
+        Ok(vec![event])
     }
 }
 
@@ -988,5 +1120,752 @@ mod tests {
     async fn get_state_store_returns_clone_of_store() {
         let agg = make_aggregate();
         let _store: InMemoryStateStore<PolicyState> = agg.get_state_store();
+    }
+
+    // =========================================================
+    // Aggregate::handle_command test helpers
+    // =========================================================
+
+    /// Build a `Command<PolicyCommand, PolicyActor>` with a test actor.
+    fn cmd(data: PolicyCommand) -> Command<PolicyCommand, PolicyActor> {
+        Command::new(
+            POLICY_AGGREGATE_ID,
+            data,
+            Some(PolicyActor { id: Uuid::new_v4() }),
+            None,
+        )
+    }
+
+    /// Build a `Command<PolicyCommand, PolicyActor>` with a specific actor ID.
+    fn cmd_with_actor(data: PolicyCommand, actor_id: Uuid) -> Command<PolicyCommand, PolicyActor> {
+        Command::new(
+            POLICY_AGGREGATE_ID,
+            data,
+            Some(PolicyActor { id: actor_id }),
+            None,
+        )
+    }
+
+    /// Helper: build a state with a UA, OA, and PC pre-populated.
+    fn state_with_ua_oa_pc(ua_id: Uuid, oa_id: Uuid, pc_id: Uuid) -> Option<PolicyState> {
+        let mut graph = PolicyGraph::new();
+        graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "test_ua".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "test_oa".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "test_pc".to_string(),
+        });
+        Some(PolicyState { graph, version: 1 })
+    }
+
+    // =========================================================
+    // Aggregate::handle_command — creation commands
+    // =========================================================
+
+    #[tokio::test]
+    async fn handle_create_ua_against_none_state_produces_event() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateUserAttribute {
+            id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let events = agg.handle_command(&None, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "UserAttributeCreated");
+        assert_eq!(events[0].stream_id, POLICY_AGGREGATE_ID);
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::UserAttributeCreated {
+                id: eid,
+                name,
+                matcher,
+            } => {
+                assert_eq!(*eid, id);
+                assert_eq!(name, "admins");
+                assert_eq!(*matcher, AttributeMatcher::All);
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_create_oa_against_none_state_produces_event() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateObjectAttribute {
+            id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        });
+        let events = agg.handle_command(&None, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "ObjectAttributeCreated");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::ObjectAttributeCreated {
+                id: eid,
+                name,
+                resource_type,
+                ..
+            } => {
+                assert_eq!(*eid, id);
+                assert_eq!(name, "alpha_jobs");
+                assert_eq!(resource_type, "job");
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_create_pc_against_none_state_produces_event() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreatePolicyClass {
+            id,
+            name: "platform".to_string(),
+        });
+        let events = agg.handle_command(&None, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "PolicyClassCreated");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::PolicyClassCreated { id: eid, name } => {
+                assert_eq!(*eid, id);
+                assert_eq!(name, "platform");
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_create_ua_against_existing_state_produces_event() {
+        let agg = make_aggregate();
+        let state = Some(PolicyState {
+            graph: PolicyGraph::new(),
+            version: 3,
+        });
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateUserAttribute {
+            id,
+            name: "editors".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "UserAttributeCreated");
+    }
+
+    // =========================================================
+    // Aggregate::handle_command — association commands (happy path)
+    // =========================================================
+
+    #[tokio::test]
+    async fn handle_create_association_with_oa_target_succeeds() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::CreateAssociation {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string(), "write".to_string()]),
+        });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "AssociationCreated");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::AssociationCreated {
+                ua_id: eid,
+                target,
+                operations,
+            } => {
+                assert_eq!(*eid, ua_id);
+                assert_eq!(*target, AssociationTarget::ObjectAttribute(oa_id));
+                assert!(operations.contains("read"));
+                assert!(operations.contains("write"));
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_create_association_with_pc_target_succeeds() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::CreateAssociation {
+            ua_id,
+            target: AssociationTarget::PolicyClass(pc_id),
+            operations: HashSet::from(["admin".to_string()]),
+        });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "AssociationCreated");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::AssociationCreated { target, .. } => {
+                assert_eq!(*target, AssociationTarget::PolicyClass(pc_id));
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_remove_association_succeeds() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::RemoveAssociation {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+        });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "AssociationRemoved");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::AssociationRemoved { ua_id: eid, target } => {
+                assert_eq!(*eid, ua_id);
+                assert_eq!(*target, AssociationTarget::ObjectAttribute(oa_id));
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    // =========================================================
+    // Aggregate::handle_command — association commands (error paths)
+    // =========================================================
+
+    #[tokio::test]
+    async fn handle_create_association_against_none_state_returns_ua_not_found() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateAssociation {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::UserAttributeNotFound(id) if id == ua_id),
+            "expected UserAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_create_association_missing_ua_returns_error() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "test_oa".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_ua_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateAssociation {
+            ua_id: missing_ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::UserAttributeNotFound(id) if id == missing_ua_id),
+            "expected UserAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_create_association_missing_oa_target_returns_error() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "test_ua".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_oa_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateAssociation {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(missing_oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(id) if id == missing_oa_id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_create_association_missing_pc_target_returns_error() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "test_ua".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_pc_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::CreateAssociation {
+            ua_id,
+            target: AssociationTarget::PolicyClass(missing_pc_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::PolicyClassNotFound(id) if id == missing_pc_id),
+            "expected PolicyClassNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_remove_association_against_none_state_returns_ua_not_found() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::RemoveAssociation {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
+        });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::UserAttributeNotFound(id) if id == ua_id),
+            "expected UserAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_remove_association_missing_ua_returns_error() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "test_oa".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_ua_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::RemoveAssociation {
+            ua_id: missing_ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::UserAttributeNotFound(id) if id == missing_ua_id),
+            "expected UserAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    // =========================================================
+    // Aggregate::handle_command — OA→PC assignment commands
+    // =========================================================
+
+    #[tokio::test]
+    async fn handle_assign_oa_to_pc_succeeds() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::AssignOaToPc { oa_id, pc_id });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "OaAssignedToPc");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::OaAssignedToPc {
+                oa_id: eid,
+                pc_id: pid,
+            } => {
+                assert_eq!(*eid, oa_id);
+                assert_eq!(*pid, pc_id);
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_assign_oa_to_pc_missing_oa_returns_error() {
+        let agg = make_aggregate();
+        let pc_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "test_pc".to_string(),
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_oa_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::AssignOaToPc {
+            oa_id: missing_oa_id,
+            pc_id,
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(id) if id == missing_oa_id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_assign_oa_to_pc_missing_pc_returns_error() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "test_oa".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_pc_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::AssignOaToPc {
+            oa_id,
+            pc_id: missing_pc_id,
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::PolicyClassNotFound(id) if id == missing_pc_id),
+            "expected PolicyClassNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_assign_oa_to_pc_against_none_state_returns_oa_not_found() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::AssignOaToPc {
+            oa_id,
+            pc_id: Uuid::new_v4(),
+        });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(id) if id == oa_id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unassign_oa_from_pc_succeeds() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::UnassignOaFromPc { oa_id, pc_id });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "OaUnassignedFromPc");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::OaUnassignedFromPc {
+                oa_id: eid,
+                pc_id: pid,
+            } => {
+                assert_eq!(*eid, oa_id);
+                assert_eq!(*pid, pc_id);
+            }
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_unassign_oa_from_pc_missing_oa_returns_error() {
+        let agg = make_aggregate();
+        let pc_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "test_pc".to_string(),
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_oa_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::UnassignOaFromPc {
+            oa_id: missing_oa_id,
+            pc_id,
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(id) if id == missing_oa_id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unassign_oa_from_pc_missing_pc_returns_error() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let mut graph = PolicyGraph::new();
+        graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "test_oa".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+
+        let missing_pc_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::UnassignOaFromPc {
+            oa_id,
+            pc_id: missing_pc_id,
+        });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::PolicyClassNotFound(id) if id == missing_pc_id),
+            "expected PolicyClassNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unassign_oa_from_pc_against_none_state_returns_oa_not_found() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::UnassignOaFromPc {
+            oa_id,
+            pc_id: Uuid::new_v4(),
+        });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(id) if id == oa_id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    // =========================================================
+    // Aggregate::handle_command — actor ID audit tests
+    // =========================================================
+
+    #[tokio::test]
+    async fn events_carry_actor_id_from_credentials() {
+        let agg = make_aggregate();
+        let actor_id = Uuid::new_v4();
+        let command = cmd_with_actor(
+            PolicyCommand::CreatePolicyClass {
+                id: Uuid::new_v4(),
+                name: "test".to_string(),
+            },
+            actor_id,
+        );
+        let events = agg.handle_command(&None, command).await.unwrap();
+        assert_eq!(events[0].actor_id, Some(actor_id));
+    }
+
+    #[tokio::test]
+    async fn events_have_none_actor_id_when_no_credentials() {
+        let agg = make_aggregate();
+        let command = Command::new(
+            POLICY_AGGREGATE_ID,
+            PolicyCommand::CreatePolicyClass {
+                id: Uuid::new_v4(),
+                name: "test".to_string(),
+            },
+            None::<PolicyActor>,
+            None,
+        );
+        let events = agg.handle_command(&None, command).await.unwrap();
+        assert_eq!(events[0].actor_id, None);
+    }
+
+    // =========================================================
+    // Aggregate round-trip tests (using full handle() flow)
+    // =========================================================
+
+    #[tokio::test]
+    async fn aggregate_round_trip_graph_queryable() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let actor_id = Uuid::new_v4();
+
+        // Create UA
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateUserAttribute {
+                    id: ua_id,
+                    name: "admins".to_string(),
+                    matcher: AttributeMatcher::All,
+                },
+                Some(PolicyActor { id: actor_id }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .graph
+                .matching_uas(&std::collections::HashMap::new())
+                .len(),
+            1
+        );
+
+        // Create OA
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateObjectAttribute {
+                    id: oa_id,
+                    name: "alpha_jobs".to_string(),
+                    resource_type: "job".to_string(),
+                    matcher: AttributeMatcher::Matching {
+                        key: "org_id".to_string(),
+                        values: vec!["alpha".to_string()],
+                    },
+                },
+                Some(PolicyActor { id: actor_id }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.graph.get_oa(oa_id).is_some());
+
+        // Create PC
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreatePolicyClass {
+                    id: pc_id,
+                    name: "platform".to_string(),
+                },
+                Some(PolicyActor { id: actor_id }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.graph.policy_classes.len(), 1);
+
+        // Assign OA→PC
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::AssignOaToPc { oa_id, pc_id },
+                Some(PolicyActor { id: actor_id }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.graph.oas_for_pc(pc_id, "job").len(), 1);
+
+        // Create association
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateAssociation {
+                    ua_id,
+                    target: AssociationTarget::ObjectAttribute(oa_id),
+                    operations: HashSet::from(["read".to_string(), "write".to_string()]),
+                },
+                Some(PolicyActor { id: actor_id }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Verify the full graph is queryable
+        let uas = state.graph.matching_uas(&std::collections::HashMap::new());
+        assert_eq!(uas.len(), 1);
+        assert_eq!(uas[0].id, ua_id);
+
+        let assocs = state.graph.associations_for_ua(ua_id);
+        assert_eq!(assocs.len(), 1);
+        assert!(assocs[0].operations.contains("read"));
+        assert!(assocs[0].operations.contains("write"));
+
+        let oas = state.graph.oas_for_pc(pc_id, "job");
+        assert_eq!(oas.len(), 1);
+        assert_eq!(oas[0].id, oa_id);
+    }
+
+    #[tokio::test]
+    async fn policy_state_version_increments_per_command() {
+        let agg = make_aggregate();
+        let actor = Some(PolicyActor { id: Uuid::new_v4() });
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreatePolicyClass {
+                    id: Uuid::new_v4(),
+                    name: "pc1".to_string(),
+                },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.get_version(), 1);
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateUserAttribute {
+                    id: Uuid::new_v4(),
+                    name: "ua1".to_string(),
+                    matcher: AttributeMatcher::All,
+                },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.get_version(), 2);
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateObjectAttribute {
+                    id: Uuid::new_v4(),
+                    name: "oa1".to_string(),
+                    resource_type: "job".to_string(),
+                    matcher: AttributeMatcher::All,
+                },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.get_version(), 3);
     }
 }
