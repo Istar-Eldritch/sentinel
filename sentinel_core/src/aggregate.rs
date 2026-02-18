@@ -18,7 +18,10 @@ use uuid::{Uuid, uuid};
 use epoch_core::prelude::*;
 use epoch_derive::EventData;
 
-use crate::{AssociationTarget, AttributeMatcher, PolicyGraph};
+use crate::{
+    Association, AssociationTarget, AttributeMatcher, ObjectAttribute, PolicyClass, PolicyGraph,
+    UserAttribute,
+};
 
 /// The well-known fixed UUID for the single policy aggregate.
 ///
@@ -256,10 +259,8 @@ pub enum PolicyCommandError {
 /// let aggregate = PolicyAggregate::new(event_store, state_store);
 /// ```
 pub struct PolicyAggregate<ES, SS> {
-    // Fields used by the Aggregate impl in Phase 4.
     #[allow(dead_code)]
     event_store: ES,
-    #[allow(dead_code)]
     state_store: SS,
 }
 
@@ -273,10 +274,85 @@ impl<ES, SS> PolicyAggregate<ES, SS> {
     }
 }
 
+impl<ES, SS> EventApplicator<PolicyEvent> for PolicyAggregate<ES, SS>
+where
+    ES: EventStoreBackend<EventType = PolicyEvent> + Send + Sync + Clone + 'static,
+    SS: StateStoreBackend<PolicyState> + Send + Sync + Clone,
+{
+    type State = PolicyState;
+    type StateStore = SS;
+    type EventType = PolicyEvent;
+    type ApplyError = PolicyApplyError;
+
+    fn apply(
+        &self,
+        state: Option<PolicyState>,
+        event: &Event<PolicyEvent>,
+    ) -> Result<Option<PolicyState>, PolicyApplyError> {
+        let mut state = state.unwrap_or_else(|| PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        });
+        match event.data.as_ref().unwrap() {
+            PolicyEvent::UserAttributeCreated { id, name, matcher } => {
+                state.graph.add_ua(UserAttribute {
+                    id: *id,
+                    name: name.clone(),
+                    matcher: matcher.clone(),
+                });
+            }
+            PolicyEvent::ObjectAttributeCreated {
+                id,
+                name,
+                resource_type,
+                matcher,
+            } => {
+                state.graph.add_oa(ObjectAttribute {
+                    id: *id,
+                    name: name.clone(),
+                    resource_type: resource_type.clone(),
+                    matcher: matcher.clone(),
+                });
+            }
+            PolicyEvent::PolicyClassCreated { id, name } => {
+                state.graph.add_pc(PolicyClass {
+                    id: *id,
+                    name: name.clone(),
+                });
+            }
+            PolicyEvent::AssociationCreated {
+                ua_id,
+                target,
+                operations,
+            } => {
+                state.graph.add_association(Association {
+                    ua_id: *ua_id,
+                    target: target.clone(),
+                    operations: operations.clone(),
+                });
+            }
+            PolicyEvent::AssociationRemoved { ua_id, target } => {
+                state.graph.remove_association(*ua_id, target);
+            }
+            PolicyEvent::OaAssignedToPc { oa_id, pc_id } => {
+                state.graph.assign_oa_to_pc(*oa_id, *pc_id);
+            }
+            PolicyEvent::OaUnassignedFromPc { oa_id, pc_id } => {
+                state.graph.unassign_oa_from_pc(*oa_id, *pc_id);
+            }
+        }
+        Ok(Some(state))
+    }
+
+    fn get_state_store(&self) -> SS {
+        self.state_store.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PolicyClass, PolicyView, UserAttribute};
+    use crate::{Association, ObjectAttribute, PolicyClass, PolicyView, UserAttribute};
 
     use epoch_mem::{InMemoryEventBus, InMemoryEventStore, InMemoryStateStore};
 
@@ -624,5 +700,293 @@ mod tests {
         let event_store = InMemoryEventStore::new(bus);
         let state_store = InMemoryStateStore::<PolicyState>::new();
         let _aggregate = PolicyAggregate::new(event_store, state_store);
+    }
+
+    // =========================================================
+    // EventApplicator test helpers
+    // =========================================================
+
+    type TestAggregate = PolicyAggregate<
+        InMemoryEventStore<InMemoryEventBus<PolicyEvent>>,
+        InMemoryStateStore<PolicyState>,
+    >;
+
+    fn make_aggregate() -> TestAggregate {
+        let bus = InMemoryEventBus::<PolicyEvent>::new();
+        let event_store = InMemoryEventStore::new(bus);
+        let state_store = InMemoryStateStore::<PolicyState>::new();
+        PolicyAggregate::new(event_store, state_store)
+    }
+
+    /// Build an `Event<PolicyEvent>` with the given data for use in `apply` tests.
+    fn make_event(data: PolicyEvent) -> Event<PolicyEvent> {
+        data.into_builder()
+            .stream_id(POLICY_AGGREGATE_ID)
+            .build()
+            .unwrap()
+    }
+
+    // =========================================================
+    // EventApplicator::apply tests
+    // =========================================================
+
+    #[tokio::test]
+    async fn apply_user_attribute_created_on_none_state() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let event = make_event(PolicyEvent::UserAttributeCreated {
+            id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let result = agg.apply(None, &event);
+        assert!(result.is_ok());
+        let state = result.unwrap().unwrap();
+        let uas = state.graph.matching_uas(&std::collections::HashMap::new());
+        assert_eq!(uas.len(), 1);
+        assert_eq!(uas[0].id, id);
+        assert_eq!(uas[0].name, "admins");
+    }
+
+    #[tokio::test]
+    async fn apply_user_attribute_created_on_existing_state() {
+        let agg = make_aggregate();
+        let existing_state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 5,
+        };
+        let id = Uuid::new_v4();
+        let event = make_event(PolicyEvent::UserAttributeCreated {
+            id,
+            name: "editors".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "role".to_string(),
+                values: vec!["editor".to_string()],
+            },
+        });
+        let result = agg.apply(Some(existing_state), &event);
+        assert!(result.is_ok());
+        let state = result.unwrap().unwrap();
+        assert_eq!(state.version, 5);
+        let uas = state.graph.matching_uas(&std::collections::HashMap::from([(
+            "role".to_string(),
+            "editor".to_string(),
+        )]));
+        assert_eq!(uas.len(), 1);
+        assert_eq!(uas[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn apply_object_attribute_created() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let event = make_event(PolicyEvent::ObjectAttributeCreated {
+            id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        });
+        let state = agg.apply(None, &event).unwrap().unwrap();
+        let oa = state.graph.get_oa(id);
+        assert!(oa.is_some());
+        let oa = oa.unwrap();
+        assert_eq!(oa.name, "alpha_jobs");
+        assert_eq!(oa.resource_type, "job");
+    }
+
+    #[tokio::test]
+    async fn apply_policy_class_created() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let event = make_event(PolicyEvent::PolicyClassCreated {
+            id,
+            name: "platform_policy".to_string(),
+        });
+        let state = agg.apply(None, &event).unwrap().unwrap();
+        assert!(state.graph.policy_classes.contains_key(&id));
+        assert_eq!(state.graph.policy_classes[&id].name, "platform_policy");
+    }
+
+    #[tokio::test]
+    async fn apply_association_created() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+
+        let event = make_event(PolicyEvent::AssociationCreated {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string(), "write".to_string()]),
+        });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        let assocs = state.graph.associations_for_ua(ua_id);
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].target, AssociationTarget::ObjectAttribute(oa_id));
+        assert!(assocs[0].operations.contains("read"));
+        assert!(assocs[0].operations.contains("write"));
+    }
+
+    #[tokio::test]
+    async fn apply_association_removed() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+
+        let event = make_event(PolicyEvent::AssociationRemoved {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+        });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(state.graph.associations_for_ua(ua_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_oa_assigned_to_pc() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "platform".to_string(),
+        });
+
+        let event = make_event(PolicyEvent::OaAssignedToPc { oa_id, pc_id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        let oas = state.graph.oas_for_pc(pc_id, "job");
+        assert_eq!(oas.len(), 1);
+        assert_eq!(oas[0].id, oa_id);
+    }
+
+    #[tokio::test]
+    async fn apply_oa_unassigned_from_pc() {
+        let agg = make_aggregate();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "platform".to_string(),
+        });
+        state.graph.assign_oa_to_pc(oa_id, pc_id);
+
+        let event = make_event(PolicyEvent::OaUnassignedFromPc { oa_id, pc_id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(state.graph.oas_for_pc(pc_id, "job").is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_always_returns_some() {
+        let agg = make_aggregate();
+        let event = make_event(PolicyEvent::PolicyClassCreated {
+            id: Uuid::new_v4(),
+            name: "test".to_string(),
+        });
+        let result = agg.apply(None, &event).unwrap();
+        assert!(result.is_some(), "apply should always return Some(state)");
+    }
+
+    #[tokio::test]
+    async fn apply_none_state_initializes_empty_graph() {
+        let agg = make_aggregate();
+        let pc_id = Uuid::new_v4();
+        let event = make_event(PolicyEvent::PolicyClassCreated {
+            id: pc_id,
+            name: "test".to_string(),
+        });
+        let state = agg.apply(None, &event).unwrap().unwrap();
+        assert_eq!(state.graph.policy_classes.len(), 1);
+        assert!(state.graph.user_attributes.is_empty());
+        assert!(state.graph.object_attributes.is_empty());
+        assert!(state.graph.associations_for_ua(Uuid::new_v4()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_sequential_events_accumulate_in_graph() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        let e1 = make_event(PolicyEvent::UserAttributeCreated {
+            id: ua_id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let e2 = make_event(PolicyEvent::ObjectAttributeCreated {
+            id: oa_id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let e3 = make_event(PolicyEvent::PolicyClassCreated {
+            id: pc_id,
+            name: "platform".to_string(),
+        });
+
+        let state = agg.apply(None, &e1).unwrap();
+        let state = agg.apply(state, &e2).unwrap();
+        let state = agg.apply(state, &e3).unwrap().unwrap();
+
+        assert_eq!(state.graph.user_attributes.len(), 1);
+        assert_eq!(state.graph.object_attributes.len(), 1);
+        assert_eq!(state.graph.policy_classes.len(), 1);
+        assert!(
+            state
+                .graph
+                .matching_uas(&std::collections::HashMap::new())
+                .len()
+                == 1
+        );
+        assert!(state.graph.get_oa(oa_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn get_state_store_returns_clone_of_store() {
+        let agg = make_aggregate();
+        let _store: InMemoryStateStore<PolicyState> = agg.get_state_store();
     }
 }
