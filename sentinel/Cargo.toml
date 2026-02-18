@@ -1,0 +1,20 @@
+[package]
+name = "sentinel"
+description = "NGAC-inspired policy enforcement library for Rust"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+categories.workspace = true
+
+[dependencies]
+sentinel_core = { path = "../sentinel_core", version = "0.1.0" }
+sentinel_derive = { path = "../sentinel_derive", optional = true, version = "0.1.0" }
+
+[features]
+default = ["derive"]
+derive = ["sentinel_derive"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

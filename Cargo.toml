@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "sentinel",
+    "sentinel_core",
+    "sentinel_derive",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Ruben Paz <me@ruben.io>"]
+keywords = ["authorization", "access-control", "ngac", "policy"]
+license = "LGPL-3.0-or-later"
+categories = ["authentication"]
