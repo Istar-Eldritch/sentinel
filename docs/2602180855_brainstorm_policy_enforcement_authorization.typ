@@ -1,8 +1,5 @@
 // Brainstorm: Policy Enforcement & Authorization (NGAC-Inspired)
 //
-// Origin: Brainstormed in the catacloud project, moved here when sentinel
-//         was established as a standalone library.
-//
 // Compile:
 //   typst compile docs/2602180855_brainstorm_policy_enforcement_authorization.typ
 
@@ -19,78 +16,67 @@
 
 = PROBLEM / OPPORTUNITY
 
-Catacloud needs a better security model. The current authorization system
-has *194+ inline role checks* scattered across *35+ files*, with patterns
-like:
+Applications that grow organically tend to accumulate scattered inline
+authorization checks. A common pattern in Rust web backends:
 
 ```rust
-if credentials.app_metadata.role != Role::PlatformAdmin {
+if credentials.role != Role::Admin {
     return Err(Unauthorized);
 }
 ```
 
-There are known gaps (3 `TODO: Unauthorized` comments where checks were
-skipped entirely). The machine supervisor runs with `Role::PlatformAdmin`
-credentials (explicit TODO to fix). The system is unsustainable to audit
-and difficult to verify for security holes.
+As a codebase matures, these checks proliferate across handlers,
+aggregate commands, and business logic — with no single place to audit
+or reason about the full access control policy. Known gaps and
+workarounds (e.g., service accounts granted admin roles for convenience)
+compound over time.
 
-The opportunity is to build a standalone, domain-agnostic NGAC-inspired
-authorization library ("sentinel") that centralizes all access control
-into a Policy Enforcement Point with a real policy graph, making the
+The opportunity is *sentinel*: a standalone, domain-agnostic
+NGAC-inspired authorization library that centralizes all access control
+into a Policy Enforcement Point backed by a real policy graph, making the
 system auditable, extensible, and eventually dynamic.
 
 #hr()
 
 = CONTEXT & BACKGROUND
 
-== Current Authorization State
+== The Typical Authorization Problem
 
-#table(
-  columns: (1fr, 2fr),
-  table.header([*Aspect*], [*Current State*]),
-  [Roles], [3 flat roles: `PlatformAdmin`, `OrganizationAdmin`, `OrganizationMember` --- no hierarchy],
-  [Enforcement layers], [Web handlers (gate HTTP by role) AND aggregates (re-check inside commands) --- inconsistent],
-  [Inline checks], [194+ occurrences of `role != Role::PlatformAdmin` across 35 files],
-  [Known gaps], [3 `TODO: Unauthorized` in `job/new.rs`, `job/get_job.rs`, `job/job_confirmation.rs`],
-  [Machine credentials], [Supervisors use `PlatformAdmin` role --- can do anything an admin can],
-  [Read-path auth], [Ad hoc: each handler builds its own `FilterLogic` with org\_id/user\_id constraints],
-  [PEP], [None --- decisions baked into business logic],
-)
+A typical application needing policy enforcement has:
+
+- *Flat roles* (e.g., `PlatformAdmin`, `OrgAdmin`, `Member`) with no
+  hierarchy — privileges are either all-or-nothing within a role
+- *Inconsistent enforcement layers* — checks at the HTTP handler level
+  and duplicated inside aggregate commands
+- *Ad-hoc list-query auth* — each handler manually constructs its own
+  filter constraints (e.g., `WHERE organization_id = $1`)
+- *No PEP* — authorization decisions are baked into business logic
 
 == Existing Proto-NGAC Patterns
 
-The system already has NGAC-like association tables that are not
+Many applications already have NGAC-like association tables that are not
 recognized as such:
 
-- `organization_job_configurations` --- Org → can\_use → JobConfiguration
-- `organization_machine_definitions` --- Org → can\_use → MachineDefinition
-- `GrantJobConfigurationAccess` / `RevokeJobConfigurationAccess` commands
-- `MachineDefinitionAccessGranted` / `MachineDefinitionAccessRevoked` events
-- `is_default_access` flag on MachineDefinition for universal access
+- Tables linking Organizations to the resource types they are allowed to
+  use (e.g., `organization_job_configurations`, `organization_machine_definitions`)
+- Grant/revoke commands and events for cross-resource access
+- Flags like `is_default_access` for universal access
 
 These are NGAC *associations between a User Attribute (Organization) and
 an Object Attribute (resource type) with an access right set*. The
-system already thinks in these terms --- it just doesn't call them that.
+domain already thinks in these terms --- it just doesn't call them that.
 
 == Resource Landscape
 
-- *User-facing aggregates* (need policy enforcement): Job, File,
-  Organization, MachinePool, MachineDefinition, Invite, User,
-  JobConfiguration (~8 aggregates)
-- *System-only aggregates* (called only by sagas with system credentials):
-  Credit, BillingLedger, Invoice, Subscription, CreditReservation,
-  CreditPurchase, SubscriptionPlan, CreditPackageDefinition,
-  ServiceCapacity (~9 aggregates)
-- *~17 aggregates total*, roughly half need user-facing auth
+A typical multi-tenant SaaS application has:
 
-== Relationship to Domain Separation
+- *User-facing aggregates* that need policy enforcement: e.g., Job,
+  File, Organization, MachinePool, Invite, User, Configuration
+- *System-only aggregates* called only by internal services with system
+  credentials: billing, invoicing, capacity management, etc.
 
-The domain separation RFC (`2602141214`) plans to split into 5 bounded
-contexts. Sentinel would be a cross-cutting infrastructure layer (like
-epoch) that every domain depends on. The cross-domain access grants
-(`GrantJobConfigurationAccess`, `GrantMachineDefinitionAccess`) currently
-on `OrganizationAggregate` would move to sentinel, resolving false
-coupling between IAM and other domains.
+Sentinel focuses on user-facing aggregates where authorization decisions
+are non-trivial.
 
 #hr()
 
@@ -150,50 +136,49 @@ regardless of data volume, then produces SQL-friendly constraints.
 `attribute_key: "id"` and `attribute_values: [specific_object_id]`. Same
 graph traversal, different attribute key. No special mechanism needed.
 
-*Default access* (like `is_default_access` on MachineDefinition) is an
-association from a root UA ("any\_authenticated\_user") to the specific
-resource's OA. Same mechanism as specific-object grants.
+*Default access* (e.g., public resources visible to all authenticated
+users) is an association from a root UA (`any_authenticated_user`) to the
+specific resource's OA. Same mechanism as specific-object grants.
 
-*Transitive file visibility* (4 paths today: own file, own job's file,
-org's file, org's config's file) is modeled as 4 separate OA nodes with
-4 associations, each carrying a different attribute key. Scope resolution
-OR-combines them naturally. Sentinel stays generic --- the transitive
-relationships are expressed as separate OAs, not as sentinel-level
-concepts.
+*Transitive visibility* (e.g., a user can see a file because they own the
+job it belongs to) is modeled as separate OA nodes — one per visibility
+path — each with a different attribute key. Scope resolution OR-combines
+them naturally. Sentinel stays generic: transitive relationships are
+expressed as separate OAs, not as sentinel-level concepts.
 
 #hr()
 
-== Design Decision 2: NGAC Graph with 5 Node Types
+== Design Decision 2: NGAC Graph with 4 Node Types
 
 #table(
   columns: (auto, auto, 2fr),
-  table.header([*Type*], [*NGAC Name*], [*Catacloud Equivalent*]),
-  [U], [User], [Individual user (alice, bob)],
-  [UA], [User Attribute], [Role-in-org: "alpha\_member", "platform\_admin"],
+  table.header([*Type*], [*NGAC Name*], [*Description*]),
+  [U], [User], [Individual subject (user, machine, system process)],
+  [UA], [User Attribute], [Role, group, or subject category],
   [OA], [Object Attribute], [Resource scope with attribute metadata],
-  [PC], [Policy Class], [Top-level scope: "org\_alpha", "platform"],
+  [PC], [Policy Class], [Top-level policy scope (org, platform)],
 )
 
 Two relationship types:
 - *Assignments*: U→UA, UA→UA, OA→OA, OA→PC (hierarchy/containment)
 - *Associations*: (UA, OA, \{access\_rights\}) --- permission grants
 
-Example graph for Catacloud:
+Example graph for a multi-tenant SaaS (ACME Corp uses sentinel):
 
 ```
 Users:                User Attributes:         Policy Classes:
-  alice ─────────────► alpha_member ──────────► org_alpha
-  bob ───────────────► alpha_admin ───────────► org_alpha
-  admin ─────────────► platform_admin ────────► platform
+  alice ─────────────► acme_member ───────────► org_acme
+  bob ───────────────► acme_admin ────────────► org_acme
+  platform ──────────► platform_admin ────────► platform
 
 Object Attributes (with attribute metadata):
-  alpha_jobs:    { resource_type: "job",  key: "organization_id", values: [alpha] }
-  alpha_files:   { resource_type: "file", key: "organization_id", values: [alpha] }
-  specific_job:  { resource_type: "job",  key: "id",              values: [job-123] }
+  acme_jobs:  { resource_type: "job",  key: "organization_id", values: [acme_id] }
+  acme_files: { resource_type: "file", key: "organization_id", values: [acme_id] }
+  job_42:     { resource_type: "job",  key: "id",              values: [job-42-uuid] }
 
 Associations:
-  (alpha_member, alpha_jobs, {read, create})
-  (alpha_admin,  alpha_jobs, {read, create, cancel_any, admin})
+  (acme_member, acme_jobs,  {read, create})
+  (acme_admin,  acme_jobs,  {read, create, cancel_any, admin})
   (platform_admin, platform, {all})
 ```
 
@@ -251,12 +236,12 @@ The application translates these to its own filter types:
 ```rust
 // Sentinel outputs (generic):
 AccessScope::Constrained(vec![
-    ScopeConstraint::Attribute { key: "organization_id", values: vec![alpha_id] },
-    ScopeConstraint::Attribute { key: "id", values: vec![job_123_id] },
+    ScopeConstraint::Attribute { key: "organization_id", values: vec![acme_id] },
+    ScopeConstraint::Attribute { key: "id", values: vec![job_42_id] },
 ])
 
 // Application translates to SQL-compatible filters:
-// WHERE organization_id = alpha_id OR id = job_123_id
+// WHERE organization_id = acme_id OR id = job_42_id
 ```
 
 === Why Attribute Constraints Over Raw OA IDs
@@ -304,10 +289,10 @@ The macro generates a wrapper that:
 === Reads: Scope Extractor for Web Handlers
 
 ```rust
-#[actix_web::get("/files")]
-async fn list_files(
+#[get("/jobs")]
+async fn list_jobs(
     credentials: Credentials,
-    scope: SentinelScope<FileFilter>,  // auto-resolved extractor
+    scope: SentinelScope<JobFilter>,  // auto-resolved extractor
     ...
 ) -> Result<...> {
     params_filters.apply_scope(scope);
@@ -315,26 +300,12 @@ async fn list_files(
 }
 ```
 
-The extractor can use route parameters to automatically provide
-scoped arguments. This is application-level sugar on top of sentinel's
-generic scope output.
+The extractor can use route parameters to automatically provide scoped
+arguments. This is application-level sugar on top of sentinel's generic
+scope output.
 
-Gate macros handle ~80% of inline auth (the 194 role checks). Scope
-extractors handle the list-query pattern.
-
-#hr()
-
-== Design Decision 6: Sentinel Before Domain Separation
-
-Sentinel should be built and integrated *before* the domain bounded
-context refactor (RFC 2602141214):
-
-- Extracts cross-domain access grants from `OrganizationAggregate`
-  into sentinel (resolves false coupling)
-- Simplifies domain separation by removing cross-domain access patterns
-- Each future domain crate depends on sentinel as infrastructure
-- The PEP is domain-agnostic --- doesn't need to know about bounded
-  contexts
+Gate macros eliminate scattered inline role checks. Scope extractors
+replace ad-hoc filter building on list endpoints.
 
 #hr()
 
@@ -344,12 +315,12 @@ NGAC natively supports org-scoped policy management: the same
 enforcement mechanism governs both data access AND policy modification.
 
 ```
-(alpha_admin, alpha_policy_subtree, {create_association, remove_association})
+(acme_admin, acme_policy_subtree, {create_association, remove_association})
 ```
 
 When Alice (org admin) tries to create a policy, the PEP checks: can
 Alice modify this part of the graph? Scoped to her policy class subtree.
-She can create associations within `org_alpha` but not `org_beta`.
+She can create associations within `org_acme` but not `org_beta`.
 
 This is modelable entirely within sentinel --- the framework handles
 mechanics, the application defines policy structure. Not needed for MVP
@@ -360,7 +331,7 @@ but a powerful differentiating feature for the future.
 == MVP Definition
 
 The minimum viable sentinel that makes the system strictly better than
-today:
+scattered inline checks:
 
 #field-list(
   ("Graph", "Platform PC, per-org PCs, role-based UAs, per-resource-type OAs with organization_id attribute matching"),
@@ -372,24 +343,23 @@ today:
 )
 
 *NOT included in MVP*: dynamic policy UI, hierarchical administration,
-specific-object grants, transitive file visibility modeled in graph
-(kept in application logic initially).
+specific-object grants, transitive visibility modeled in graph (kept in
+application logic initially).
 
 #hr()
 
 = OUT OF SCOPE
 
-- *Integration specifics*: How catacloud seeds the graph, how sagas
-  issue sentinel commands, specific filter translation code --- these
-  are application-level concerns for the integration spec
+- *Application integration specifics*: How a consuming application seeds
+  the graph, how sagas issue sentinel commands, specific filter
+  translation code --- these are application-level concerns
 - *Dynamic policy UI*: Future enhancement; architecture supports it
 - *Authentication*: Sentinel handles authorization only; JWT/sessions
-  stay as-is
-- *Billing/capability checks*: "Can this org submit a job?" based on
-  credits is a capability check, not authorization --- remains separate
-- *Supervisor role details*: The machine credential fix is adjacent;
-  sentinel provides the framework, but `Subject::Machine` specifics
-  are an integration detail
+  remain the application's responsibility
+- *Capability checks*: "Can this org submit a job given their billing
+  plan?" is a capability check, not authorization --- remains separate
+- *Subject-type specifics*: `Subject::Machine` or service account details
+  are integration concerns; sentinel provides the framework
 
 #hr()
 
@@ -412,45 +382,36 @@ specific-object grants, transitive file visibility modeled in graph
    (e.g., `file_extension = "pdf"`)? Affects `ScopeConstraint` type
    design.
 
-5. *Transitive visibility long-term*: Files have 4 visibility paths
-   modeled as 4 OA nodes. Is this sufficient long-term, or would
+5. *Transitive visibility long-term*: Multiple visibility paths
+   modeled as multiple OA nodes. Is this sufficient long-term, or would
    sentinel ever benefit from understanding transitivity natively?
 
 #hr()
 
 = ROUGH SCOPE ASSESSMENT
 
-This is an *epic-level effort*, decomposable into at least 3 specs:
+This is an *epic-level effort*, decomposable into at least 2 phases:
 
 #table(
   columns: (auto, 2fr, auto),
   table.header([*Phase*], [*Scope*], [*Estimate*]),
-  [1], [*Sentinel library* (standalone): Core graph model (`sentinel_core`), PEP evaluation, scope resolution, derive macros (`sentinel_derive`), facade crate. Uses epoch for event sourcing --- no sentinel-specific backends. Developed and tested independently.], [2--3 weeks],
-  [2], [*Catacloud integration*: Replace 194+ inline checks, migrate access grant tables into policy graph, add scope extractors, fix TODO gaps, add Machine/System subject types.], [2--3 weeks],
+  [1], [*Sentinel library* (standalone): Core graph model (`sentinel_core`), PEP evaluation (`evaluate` + `scope`), scope resolution, derive macros (`sentinel_derive`), facade crate. Uses epoch for event sourcing --- no sentinel-specific backends. Developed and tested independently.], [2--3 weeks],
+  [2], [*Application integration*: Replace scattered inline checks, migrate existing access-grant tables into the policy graph, add scope extractors, integrate `Subject::Machine` / `Subject::System` types.], [2--3 weeks],
 )
 
 *Total estimate*: ~4--6 weeks of focused work, delivered incrementally.
 The sentinel library is independently valuable and testable. Integration
 can proceed aggregate-by-aggregate.
 
-*Dependency*: Should complete before the domain bounded context
-separation (RFC 2602141214) to simplify that refactor.
-
 #hr()
 
 = RELATED DOCUMENTS
 
-- [Domain Bounded Context Separation](./2602141214_rfc_domain_bounded_context_separation.typ) ---
-  RFC that sentinel should precede
-- [Entity Relationships Guide](./015_guide_entity_relationships.md) ---
-  Resource ownership model
-- [Job Infrastructure](./018_spec_infra_job_infrastructure.md) ---
-  Saga patterns and machine lifecycle
-- [Testing Strategy](./030_guide_testing_strategy.md) ---
-  Testing pyramid for sentinel integration
+- `epoch` framework documentation --- event sourcing patterns sentinel
+  builds on
 
 #note-box[
   This document captures brainstorm outcomes. Next step: create a
-  formal spec (`spec_auth_sentinel_library.typ`) with detailed
+  formal spec (`spec_sentinel_library.typ`) with detailed
   implementation plan, phase files, and success criteria.
 ]
