@@ -9,7 +9,7 @@ Sentinel provides a centralized Policy Enforcement Point (PEP) backed by an attr
 - **Attribute-matching model**: Resources are not nodes in the graph. Object Attribute (OA) nodes carry metadata about which resource attributes they match, keeping the graph small regardless of data volume.
 - **NGAC graph**: 4 node types (User, User Attribute, Object Attribute, Policy Class) with assignment edges and association edges carrying access rights.
 - **Two enforcement modes**: Point checks (`evaluate`) for command authorization; scope resolution (`scope`) for producing query filter constraints.
-- **Event-sourced**: The policy graph is persisted via the [epoch](https://github.com/mariozechner/epoch) CQRS/event-sourcing framework.
+- **Event-sourced**: The policy graph is persisted via the [epoch](https://github.com/Istar-Eldritch/epoch) CQRS/event-sourcing framework.
 
 ## Crate Structure
 
