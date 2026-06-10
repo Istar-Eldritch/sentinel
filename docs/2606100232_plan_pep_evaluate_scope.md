@@ -8,6 +8,21 @@
 
 ---
 
+## Implementation Plan
+
+The table below is the canonical phase list parsed by the spec pipeline
+(`/implement`). Detailed per-phase TDD breakdowns follow in §4–§8.
+
+| Phase | Focus | Effort |
+|-------|-------|--------|
+| Phase 1 | Multi-valued attribute matching foundation — set-intersection semantics for subject/resource attributes (REQ-HARD-004, D18) | 0.5 day |
+| Phase 2 | Aggregate and graph hardening — association upsert identity, event-replay coherence, fallible event application (REQ-HARD-001…003) | 0.5 day |
+| Phase 3 | PEP point-check authorization — Decision, AccessRequest, and evaluate() over PolicyView (REQ-EVAL-001…005) | 1 day |
+| Phase 4 | PEP scope resolution — AccessScope, ScopeConstraint, ScopeRequest, and scope() for list-query filter injection (REQ-SCOPE-001…006) | 1 day |
+| Phase 5 | Soundness invariant verification and final documentation sweep — evaluate/scope consistency across canonical patterns (REQ-INV-001, REQ-DOC-003/004) | 0.5 day |
+
+---
+
 ## 1. Purpose & Scope
 
 This plan sequences the implementation of the approved spec's 21 requirements into
