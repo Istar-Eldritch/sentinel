@@ -18,7 +18,17 @@ use uuid::Uuid;
 /// subjects or resources fall under their scope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AttributeMatcher {
-    /// Wildcard matcher — matches any attribute set unconditionally.
+    /// Wildcard matcher — matches any attribute set unconditionally, including
+    /// the **empty map**.
+    ///
+    /// # Security note — unauthenticated subjects
+    ///
+    /// An `All`-matcher [`UserAttribute`] matches a subject that carries *no*
+    /// attributes, which is indistinguishable from an unauthenticated request.
+    /// Applications **must** enforce authentication before calling
+    /// [`evaluate`] or `scope` for non-public resources. Use `All`-matcher
+    /// UAs only for genuinely public resources that every caller — including
+    /// unauthenticated ones — may access.
     All,
     /// Matches when the attribute map contains the specified `key` and
     /// its value is found in `values`.
@@ -305,6 +315,126 @@ impl PolicyView for PolicyGraph {
             .filter(|oa| oa.resource_type == resource_type)
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// PEP types and functions (Feature 3 — evaluate)
+// ---------------------------------------------------------------------------
+
+/// The outcome of a point authorization check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// The subject may perform the operation on the resource.
+    Allow,
+    /// The subject may not perform the operation on the resource.
+    Deny,
+}
+
+/// A point-check request.
+///
+/// Chained setters keep the API open for future fields (e.g. environment
+/// attributes) without breaking changes (epic R9). Required fields
+/// (`operation`, `resource_type`) are constructor arguments — an
+/// operation-less request is unrepresentable. There is no `.build()`;
+/// the struct is its own builder.
+///
+/// Attribute maps are multi-valued (`HashMap<String, HashSet<String>>`) per
+/// D18 and default to empty (fail-closed) until set.
+#[derive(Debug, Clone)]
+pub struct AccessRequest {
+    subject_attrs: HashMap<String, HashSet<String>>,
+    operation: String,
+    resource_type: String,
+    resource_attrs: HashMap<String, HashSet<String>>,
+}
+
+impl AccessRequest {
+    /// Creates a new request with the given `operation` and `resource_type`.
+    ///
+    /// Both attribute maps default to empty, which is fail-closed: a subject
+    /// with no attributes will only be granted access through an
+    /// `All`-matcher UA (see [`AttributeMatcher::All`] security note).
+    pub fn new(operation: impl Into<String>, resource_type: impl Into<String>) -> Self {
+        Self {
+            subject_attrs: HashMap::new(),
+            operation: operation.into(),
+            resource_type: resource_type.into(),
+            resource_attrs: HashMap::new(),
+        }
+    }
+
+    /// Sets the subject's attributes (consuming setter).
+    ///
+    /// Replaces the previously set (or default-empty) subject attribute map.
+    pub fn subject_attrs(self, attrs: HashMap<String, HashSet<String>>) -> Self {
+        Self {
+            subject_attrs: attrs,
+            ..self
+        }
+    }
+
+    /// Sets the resource's attributes (consuming setter).
+    ///
+    /// Replaces the previously set (or default-empty) resource attribute map.
+    pub fn resource_attrs(self, attrs: HashMap<String, HashSet<String>>) -> Self {
+        Self {
+            resource_attrs: attrs,
+            ..self
+        }
+    }
+}
+
+/// Evaluates whether the subject described by `request` may perform the
+/// requested operation on the described resource.
+///
+/// Returns [`Decision::Allow`] when at least one matching grant path is found;
+/// [`Decision::Deny`] otherwise (fail-closed).
+///
+/// # Algorithm (per D16)
+///
+/// 1. Collect all UAs whose matcher matches `request.subject_attrs`.
+/// 2. For each UA, for each association from that UA:
+///    - Skip if the association's operation set does not contain the requested
+///      operation.
+///    - `ObjectAttribute(oa_id)` target: look up the OA. If it exists, its
+///      `resource_type` matches the request, **and** its matcher matches
+///      `request.resource_attrs` → return `Allow`. If the OA is missing
+///      (dangling reference), skip — fail-closed (REQ-EVAL-005).
+///    - `PolicyClass(pc_id)` target: collect all OAs assigned to the PC for
+///      the requested `resource_type`; if **any** OA's matcher matches
+///      `request.resource_attrs` → return `Allow`. Mere existence of OAs
+///      under the PC is not sufficient (D16 Option B, REQ-EVAL-004).
+/// 3. Return `Deny`.
+pub fn evaluate(view: &impl PolicyView, request: &AccessRequest) -> Decision {
+    let uas = view.matching_uas(&request.subject_attrs);
+    for ua in uas {
+        for assoc in view.associations_for_ua(ua.id) {
+            if !assoc.operations.contains(&request.operation) {
+                continue;
+            }
+            match &assoc.target {
+                AssociationTarget::ObjectAttribute(oa_id) => {
+                    if let Some(oa) = view.get_oa(*oa_id)
+                        && oa.resource_type == request.resource_type
+                        && oa.matcher.matches(&request.resource_attrs)
+                    {
+                        return Decision::Allow;
+                    }
+                    // dangling OA reference — skip, fail-closed (REQ-EVAL-005)
+                }
+                AssociationTarget::PolicyClass(pc_id) => {
+                    let oas = view.oas_for_pc(*pc_id, &request.resource_type);
+                    if oas
+                        .iter()
+                        .any(|oa| oa.matcher.matches(&request.resource_attrs))
+                    {
+                        return Decision::Allow;
+                    }
+                }
+            }
+        }
+    }
+    Decision::Deny
 }
 
 #[cfg(test)]
@@ -2058,6 +2188,353 @@ mod tests {
 
         // Beta PC has no documents
         assert!(graph.oas_for_pc(pc_beta.id, "document").is_empty());
+    }
+
+    // =========================================================
+    // Phase 3 — evaluate() tests (REQ-EVAL-001…005, REQ-DOC-001)
+    // =========================================================
+
+    // ---- Fixture helpers ----
+
+    /// Builds a minimal graph for evaluate() tests:
+    ///
+    /// - `ua_alpha_members`: Matching { org_id ∈ ["alpha"] }
+    /// - `oa_alpha_jobs`: resource_type="job", Matching { org_id ∈ ["alpha"] }
+    /// - `assoc`: (ua_alpha_members → oa_alpha_jobs, {"read"})
+    ///
+    /// Returns (graph, ua_id, oa_id).
+    fn eval_basic_graph() -> (PolicyGraph, Uuid, Uuid) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_members".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        (graph, ua.id, oa.id)
+    }
+
+    // ---- AccessRequest type-shape tests ----
+
+    /// `AccessRequest::new` yields empty attribute maps (fail-closed defaults).
+    #[test]
+    fn access_request_new_has_empty_attrs() {
+        let req = AccessRequest::new("read", "job");
+        assert_eq!(req.operation, "read");
+        assert_eq!(req.resource_type, "job");
+        assert!(req.subject_attrs.is_empty());
+        assert!(req.resource_attrs.is_empty());
+    }
+
+    /// Consuming setters can be chained in either order.
+    #[test]
+    fn access_request_setters_chain_in_any_order() {
+        let s = attrs(&[("role", &["admin"])]);
+        let r = attrs(&[("org_id", &["alpha"])]);
+        let req1 = AccessRequest::new("write", "doc")
+            .subject_attrs(s.clone())
+            .resource_attrs(r.clone());
+        let req2 = AccessRequest::new("write", "doc")
+            .resource_attrs(r.clone())
+            .subject_attrs(s.clone());
+        assert_eq!(req1.subject_attrs, req2.subject_attrs);
+        assert_eq!(req1.resource_attrs, req2.resource_attrs);
+    }
+
+    /// Empty subject attrs against a non-All graph → Deny (fail-closed).
+    #[test]
+    fn evaluate_empty_subject_attrs_against_non_all_graph_is_deny() {
+        let (graph, _, _) = eval_basic_graph();
+        // No subject attributes provided — can't match Matching UA
+        let req = AccessRequest::new("read", "job");
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    // ---- evaluate() core behavior tests (REQ-EVAL-003) ----
+
+    /// Allow via UA→OA: matching UA, association with the operation, OA with
+    /// matching resource_type and matcher.
+    #[test]
+    fn evaluate_allows_via_ua_oa_match() {
+        let (graph, _, _) = eval_basic_graph();
+        let req = AccessRequest::new("read", "job")
+            .subject_attrs(attrs(&[("org_id", &["alpha"])]))
+            .resource_attrs(attrs(&[("org_id", &["alpha"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Allow);
+    }
+
+    /// Deny when the operation is absent from the association's operation set.
+    #[test]
+    fn evaluate_denies_when_operation_absent() {
+        let (graph, _, _) = eval_basic_graph();
+        // Association only carries "read"; request asks for "write"
+        let req = AccessRequest::new("write", "job")
+            .subject_attrs(attrs(&[("org_id", &["alpha"])]))
+            .resource_attrs(attrs(&[("org_id", &["alpha"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    /// Deny when no UA matches the subject attributes.
+    #[test]
+    fn evaluate_denies_when_no_ua_matches() {
+        let (graph, _, _) = eval_basic_graph();
+        // Subject is in org "gamma", but the only UA matches "alpha"
+        let req = AccessRequest::new("read", "job")
+            .subject_attrs(attrs(&[("org_id", &["gamma"])]))
+            .resource_attrs(attrs(&[("org_id", &["gamma"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    /// Deny when the OA's resource_type does not match the request's resource_type.
+    #[test]
+    fn evaluate_denies_on_resource_type_mismatch() {
+        let (graph, _, _) = eval_basic_graph();
+        // OA is "job" but request asks for "document"
+        let req = AccessRequest::new("read", "document")
+            .subject_attrs(attrs(&[("org_id", &["alpha"])]))
+            .resource_attrs(attrs(&[("org_id", &["alpha"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    /// Deny when the OA's matcher does not match the resource attributes.
+    #[test]
+    fn evaluate_denies_when_matcher_does_not_match_resource_attrs() {
+        let (graph, _, _) = eval_basic_graph();
+        // OA matches org_id ∈ ["alpha"] but resource is in org "beta"
+        let req = AccessRequest::new("read", "job")
+            .subject_attrs(attrs(&[("org_id", &["alpha"])]))
+            .resource_attrs(attrs(&[("org_id", &["beta"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    /// D18 multi-valued subject: a subject with org_id ∈ {alpha, beta} is
+    /// allowed through an alpha-scoped UA→OA path.
+    #[test]
+    fn evaluate_allows_multivalued_subject_via_alpha_path() {
+        let (graph, _, _) = eval_basic_graph();
+        // Subject belongs to both alpha and beta; alpha grants read on alpha jobs
+        let req = AccessRequest::new("read", "job")
+            .subject_attrs(attrs(&[("org_id", &["alpha", "beta"])]))
+            .resource_attrs(attrs(&[("org_id", &["alpha"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Allow);
+    }
+
+    /// REQ-DOC-001 sharp edge: an All-matcher UA matches an **empty** subject
+    /// attribute map (unauthenticated subjects). Test asserts Allow for the
+    /// public-resource pattern with empty subject attrs.
+    #[test]
+    fn evaluate_all_matcher_ua_with_empty_subject_attrs_allows_public_resource() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "public".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "public_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Empty subject attrs — unauthenticated caller — still matches All UA
+        let req = AccessRequest::new("read", "job");
+        assert_eq!(evaluate(&graph, &req), Decision::Allow);
+    }
+
+    // ---- evaluate() UA→PC path tests (REQ-EVAL-004, D16) ----
+
+    /// Allow via UA→PC: OA under the PC matches both resource type and resource
+    /// attributes.
+    #[test]
+    fn evaluate_allows_via_ua_pc_when_oa_matches() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "org_admins".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "org_alpha_pc".to_string(),
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Alpha member requests alpha job → Allow
+        let req = AccessRequest::new("read", "job")
+            .subject_attrs(attrs(&[("org_id", &["alpha"])]))
+            .resource_attrs(attrs(&[("org_id", &["alpha"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Allow);
+    }
+
+    /// REQ-EVAL-004 locked-in review counterexample:
+    /// `(org_admins, org_alpha_pc, {read})` with
+    /// `alpha_jobs { resource_type: "job", matcher: Matching { org_id ∈ ["alpha"] } }`
+    /// under `org_alpha_pc`; requesting a job with `org_id: "beta"` → Deny.
+    ///
+    /// This locks in Option B (D16): UA→PC keeps the OA-matcher check;
+    /// mere existence of OAs under a PC is NOT sufficient.
+    #[test]
+    fn evaluate_denies_review_counterexample_beta_job_under_alpha_pc() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "org_admins".to_string(),
+            // Subject has org_id="beta" — but that matches this Matching UA
+            // because the UA itself matches any alpha subjects. We need
+            // the subject to match the UA but the resource to fail the OA
+            // matcher. Use an All-matcher UA so any subject matches.
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "org_alpha_pc".to_string(),
+        };
+        // OA only admits alpha jobs
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Resource is a beta-org job — OA matcher (org_id=alpha) does NOT match
+        let req = AccessRequest::new("read", "job")
+            .subject_attrs(attrs(&[("org_id", &["beta"])]))
+            .resource_attrs(attrs(&[("org_id", &["beta"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    /// Deny when the PC has no OA for the requested resource type (fail-closed).
+    #[test]
+    fn evaluate_denies_when_pc_has_no_oa_for_resource_type() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_pc".to_string(),
+        };
+        // Only a "document" OA under the PC — no "job" OA
+        let oa_doc = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "all_docs".to_string(),
+            resource_type: "document".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa_doc.clone());
+        graph.assign_oa_to_pc(oa_doc.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Request for "job" resource type — no OA of that type under the PC
+        let req = AccessRequest::new("read", "job");
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    // ---- evaluate() dangling OA reference test (REQ-EVAL-005) ----
+
+    /// Deny when an association targets a nonexistent OA (dangling reference).
+    /// No panic; the association is skipped fail-closed.
+    #[test]
+    fn evaluate_denies_on_dangling_oa_reference() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "members".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        // Association points to an OA that was never added to the graph
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = AccessRequest::new("read", "job");
+        // Must not panic; dangling reference → Deny
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    // ---- Decision type tests (REQ-EVAL-001) ----
+
+    #[test]
+    fn decision_allow_and_deny_are_not_equal() {
+        assert_ne!(Decision::Allow, Decision::Deny);
+    }
+
+    #[test]
+    fn decision_is_copy() {
+        let d = Decision::Allow;
+        let d2 = d; // Copy — d still usable
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn decision_debug() {
+        assert!(format!("{:?}", Decision::Allow).contains("Allow"));
+        assert!(format!("{:?}", Decision::Deny).contains("Deny"));
     }
 }
 
