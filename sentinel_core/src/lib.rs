@@ -35,14 +35,17 @@ impl AttributeMatcher {
     /// Tests whether the given attribute map satisfies this matcher.
     ///
     /// - [`AttributeMatcher::All`] always returns `true`.
-    /// - [`AttributeMatcher::Matching`] returns `true` if `attrs` contains
-    ///   the specified `key` and its value is in `values`; `false` otherwise.
-    pub fn matches(&self, attrs: &HashMap<String, String>) -> bool {
+    /// - [`AttributeMatcher::Matching`] returns `true` when `attrs` contains
+    ///   `key` and the value-set for that key has a **non-empty intersection**
+    ///   with the matcher's `values` (D18 semantics).
+    /// - A key mapped to an **empty set** behaves exactly like an absent key
+    ///   (fail-closed: `any` over an empty set is `false`).
+    pub fn matches(&self, attrs: &HashMap<String, HashSet<String>>) -> bool {
         match self {
             AttributeMatcher::All => true,
-            AttributeMatcher::Matching { key, values } => {
-                attrs.get(key).is_some_and(|v| values.contains(v))
-            }
+            AttributeMatcher::Matching { key, values } => attrs
+                .get(key)
+                .is_some_and(|vs| vs.iter().any(|v| values.contains(v))),
         }
     }
 }
@@ -134,9 +137,11 @@ pub struct Association {
 pub trait PolicyView {
     /// Returns all user attributes whose matcher matches the given subject attributes.
     ///
-    /// Iterates over every [`UserAttribute`] in the graph and returns those
-    /// where `matcher.matches(subject_attrs)` is `true`.
-    fn matching_uas(&self, subject_attrs: &HashMap<String, String>) -> Vec<&UserAttribute>;
+    /// Subject attributes are multi-valued (D18): each key maps to a
+    /// `HashSet<String>`. Iterates over every [`UserAttribute`] in the graph
+    /// and returns those where `matcher.matches(subject_attrs)` is `true`.
+    fn matching_uas(&self, subject_attrs: &HashMap<String, HashSet<String>>)
+    -> Vec<&UserAttribute>;
 
     /// Returns all associations originating from the given user attribute.
     ///
@@ -263,7 +268,10 @@ impl Default for PolicyGraph {
 }
 
 impl PolicyView for PolicyGraph {
-    fn matching_uas(&self, subject_attrs: &HashMap<String, String>) -> Vec<&UserAttribute> {
+    fn matching_uas(
+        &self,
+        subject_attrs: &HashMap<String, HashSet<String>>,
+    ) -> Vec<&UserAttribute> {
         self.user_attributes
             .values()
             .filter(|ua| ua.matcher.matches(subject_attrs))
@@ -298,6 +306,17 @@ mod tests {
     use std::collections::HashSet;
     use uuid::Uuid;
 
+    /// Constructs a multi-valued attribute map from key-value pairs.
+    ///
+    /// Each pair maps a key to one or more string values. Useful for building
+    /// `&HashMap<String, HashSet<String>>` arguments in tests concisely.
+    fn attrs(pairs: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+        pairs
+            .iter()
+            .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))
+            .collect()
+    }
+
     // --- AttributeMatcher::All tests ---
 
     #[test]
@@ -309,7 +328,7 @@ mod tests {
     #[test]
     fn all_matcher_matches_any_attrs() {
         let matcher = AttributeMatcher::All;
-        let attrs = HashMap::from([("key".to_string(), "value".to_string())]);
+        let attrs = HashMap::from([("key".to_string(), HashSet::from(["value".to_string()]))]);
         assert!(matcher.matches(&attrs));
     }
 
@@ -321,7 +340,7 @@ mod tests {
             key: "org_id".to_string(),
             values: vec!["alpha".to_string()],
         };
-        let attrs = HashMap::from([("org_id".to_string(), "alpha".to_string())]);
+        let attrs = HashMap::from([("org_id".to_string(), HashSet::from(["alpha".to_string()]))]);
         assert!(matcher.matches(&attrs));
     }
 
@@ -331,7 +350,7 @@ mod tests {
             key: "org_id".to_string(),
             values: vec!["alpha".to_string()],
         };
-        let attrs = HashMap::from([("other".to_string(), "alpha".to_string())]);
+        let attrs = HashMap::from([("other".to_string(), HashSet::from(["alpha".to_string()]))]);
         assert!(!matcher.matches(&attrs));
     }
 
@@ -341,7 +360,7 @@ mod tests {
             key: "org_id".to_string(),
             values: vec!["alpha".to_string()],
         };
-        let attrs = HashMap::from([("org_id".to_string(), "beta".to_string())]);
+        let attrs = HashMap::from([("org_id".to_string(), HashSet::from(["beta".to_string()]))]);
         assert!(!matcher.matches(&attrs));
     }
 
@@ -351,7 +370,7 @@ mod tests {
             key: "org_id".to_string(),
             values: vec!["alpha".to_string(), "beta".to_string()],
         };
-        let attrs = HashMap::from([("org_id".to_string(), "beta".to_string())]);
+        let attrs = HashMap::from([("org_id".to_string(), HashSet::from(["beta".to_string()]))]);
         assert!(matcher.matches(&attrs));
     }
 
@@ -370,8 +389,78 @@ mod tests {
             key: "org_id".to_string(),
             values: vec![],
         };
-        let attrs = HashMap::from([("org_id".to_string(), "alpha".to_string())]);
+        let attrs = HashMap::from([("org_id".to_string(), HashSet::from(["alpha".to_string()]))]);
         assert!(!matcher.matches(&attrs));
+    }
+
+    // --- D18 multi-valued intersection semantics tests ---
+
+    /// An input key mapped to multiple values matches when at least one
+    /// of those values is present in the matcher's `values` list.
+    #[test]
+    fn matches_multivalued_intersection_match() {
+        let matcher = AttributeMatcher::Matching {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        };
+        // subject org_id ∈ {alpha, beta} — non-empty intersection with ["alpha"]
+        assert!(matcher.matches(&attrs(&[("org_id", &["alpha", "beta"])])));
+    }
+
+    /// An input key mapped to values that share no element with the matcher's
+    /// `values` list never matches.
+    #[test]
+    fn matches_multivalued_disjoint_no_match() {
+        let matcher = AttributeMatcher::Matching {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        };
+        // subject org_id ∈ {gamma} — disjoint from ["alpha"]
+        assert!(!matcher.matches(&attrs(&[("org_id", &["gamma"])])));
+    }
+
+    /// A key mapped to an empty set never matches — identical to an absent key
+    /// (fail-closed: `any` over an empty set is `false`).
+    #[test]
+    fn matches_empty_set_no_match() {
+        let matcher = AttributeMatcher::Matching {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        };
+        // org_id → {} behaves the same as org_id absent
+        assert!(!matcher.matches(&attrs(&[("org_id", &[])])));
+    }
+
+    /// `All` matcher semantics are unchanged under the multi-valued signature:
+    /// it matches the empty map and any non-empty map.
+    #[test]
+    fn all_matcher_unchanged_with_multivalued_signature() {
+        let matcher = AttributeMatcher::All;
+        assert!(matcher.matches(&HashMap::new()));
+        assert!(matcher.matches(&attrs(&[("org_id", &["alpha", "beta"])])));
+    }
+
+    /// `matching_uas` respects multi-valued subject attributes (D18):
+    /// a subject with `org_id ∈ {alpha, beta}` matches a UA whose
+    /// `Matching { key: "org_id", values: ["alpha"] }` matcher is satisfied
+    /// by intersection.
+    #[test]
+    fn matching_uas_multivalued_subject_intersection() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "org_alpha_members".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        // Subject belongs to both alpha and beta — should match via alpha
+        let subject = attrs(&[("org_id", &["alpha", "beta"])]);
+        let matching = graph.matching_uas(&subject);
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].id, ua.id);
     }
 
     // --- PartialEq tests ---
@@ -1347,7 +1436,8 @@ mod tests {
         graph.add_ua(ua_alpha.clone());
         graph.add_ua(ua_beta.clone());
 
-        let alpha_subject = HashMap::from([("org_id".to_string(), "alpha".to_string())]);
+        let alpha_subject =
+            HashMap::from([("org_id".to_string(), HashSet::from(["alpha".to_string()]))]);
         let matching = graph.matching_uas(&alpha_subject);
 
         // Should match: ua_all (All always matches) and ua_alpha (org_id=alpha)
@@ -1379,7 +1469,7 @@ mod tests {
         // Arbitrary attrs
         let m2 = graph.matching_uas(&HashMap::from([(
             "org_id".to_string(),
-            "whatever".to_string(),
+            HashSet::from(["whatever".to_string()]),
         )]));
         assert_eq!(m2.len(), 1);
         assert_eq!(m2[0].id, ua_all.id);
@@ -1400,7 +1490,8 @@ mod tests {
         };
         graph.add_ua(ua);
 
-        let gamma_subject = HashMap::from([("org_id".to_string(), "gamma".to_string())]);
+        let gamma_subject =
+            HashMap::from([("org_id".to_string(), HashSet::from(["gamma".to_string()]))]);
         assert!(graph.matching_uas(&gamma_subject).is_empty());
     }
 
@@ -1440,7 +1531,8 @@ mod tests {
         };
         graph.add_ua(ua.clone());
 
-        let beta_subject = HashMap::from([("org_id".to_string(), "beta".to_string())]);
+        let beta_subject =
+            HashMap::from([("org_id".to_string(), HashSet::from(["beta".to_string()]))]);
         let matching = graph.matching_uas(&beta_subject);
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].id, ua.id);
@@ -1462,9 +1554,12 @@ mod tests {
         graph.add_ua(ua.clone());
 
         let subject_with_extras = HashMap::from([
-            ("org_id".to_string(), "alpha".to_string()),
-            ("role".to_string(), "admin".to_string()),
-            ("department".to_string(), "engineering".to_string()),
+            ("org_id".to_string(), HashSet::from(["alpha".to_string()])),
+            ("role".to_string(), HashSet::from(["admin".to_string()])),
+            (
+                "department".to_string(),
+                HashSet::from(["engineering".to_string()]),
+            ),
         ]);
         let matching = graph.matching_uas(&subject_with_extras);
         assert_eq!(matching.len(), 1);
@@ -1871,21 +1966,23 @@ mod tests {
 
         // --- Verify: matching_uas ---
         // An alpha member should match ua_alpha_members only
-        let alpha_subject = HashMap::from([("org_id".to_string(), "alpha".to_string())]);
+        let alpha_subject =
+            HashMap::from([("org_id".to_string(), HashSet::from(["alpha".to_string()]))]);
         let alpha_uas = graph.matching_uas(&alpha_subject);
         assert_eq!(alpha_uas.len(), 1);
         assert_eq!(alpha_uas[0].id, ua_alpha_members.id);
 
         // A platform admin (not in any org) should match ua_admins only
-        let admin_subject = HashMap::from([("role".to_string(), "admin".to_string())]);
+        let admin_subject =
+            HashMap::from([("role".to_string(), HashSet::from(["admin".to_string()]))]);
         let admin_uas = graph.matching_uas(&admin_subject);
         assert_eq!(admin_uas.len(), 1);
         assert_eq!(admin_uas[0].id, ua_admins.id);
 
         // An alpha admin matches both ua_alpha_members and ua_admins
         let alpha_admin_subject = HashMap::from([
-            ("org_id".to_string(), "alpha".to_string()),
-            ("role".to_string(), "admin".to_string()),
+            ("org_id".to_string(), HashSet::from(["alpha".to_string()])),
+            ("role".to_string(), HashSet::from(["admin".to_string()])),
         ]);
         let alpha_admin_uas = graph.matching_uas(&alpha_admin_subject);
         assert_eq!(alpha_admin_uas.len(), 2);
@@ -1894,7 +1991,8 @@ mod tests {
         assert!(ua_ids.contains(&ua_admins.id));
 
         // A user in org "gamma" matches no UAs
-        let gamma_subject = HashMap::from([("org_id".to_string(), "gamma".to_string())]);
+        let gamma_subject =
+            HashMap::from([("org_id".to_string(), HashSet::from(["gamma".to_string()]))]);
         assert!(graph.matching_uas(&gamma_subject).is_empty());
 
         // --- Verify: associations_for_ua ---

@@ -698,6 +698,15 @@ refactor.
   [D15], [No wildcard access rights],
     [Fail-closed: new operations require explicit grants; prevents
      implicit security holes],
+  [D18], [Request attributes are multi-valued sets (`HashMap<String, HashSet<String>>`)],
+    [Both subject and resource attributes are multi-valued: each key maps
+     to a `HashSet<String>`. Matching semantics become non-empty
+     intersection: `Matching { key, values }` matches when the input set
+     for `key` shares at least one value with the matcher's `values`. A
+     key mapped to an empty set behaves like an absent key (fail-closed).
+     The policy side (`Matching::values`) stays `Vec<String>` for
+     serialisation stability. Amended from the original single-valued
+     design during the 2026-06-10 review.],
 )
 
 #hr()

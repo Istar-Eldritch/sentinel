@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(state.version, 5);
         let uas = state.graph.matching_uas(&std::collections::HashMap::from([(
             "role".to_string(),
-            "editor".to_string(),
+            std::collections::HashSet::from(["editor".to_string()]),
         )]));
         assert_eq!(uas.len(), 1);
         assert_eq!(uas[0].id, id);
