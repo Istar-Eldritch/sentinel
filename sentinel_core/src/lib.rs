@@ -437,6 +437,184 @@ pub fn evaluate(view: &impl PolicyView, request: &AccessRequest) -> Decision {
     Decision::Deny
 }
 
+// ---------------------------------------------------------------------------
+// PEP types and functions (Feature 4 — scope)
+// ---------------------------------------------------------------------------
+
+/// A scope-resolution request for list-query filter injection.
+///
+/// Chained setters keep the API open for future fields (e.g. environment
+/// attributes) without breaking changes (epic R9). Required fields
+/// (`operation`, `resource_type`) are constructor arguments — an
+/// operation-less request is unrepresentable. There is no `.build()`;
+/// the struct is its own builder.
+///
+/// Subject attributes are multi-valued (`HashMap<String, HashSet<String>>`) per
+/// D18 and default to empty (fail-closed) until set.
+#[derive(Debug, Clone)]
+pub struct ScopeRequest {
+    subject_attrs: HashMap<String, HashSet<String>>,
+    operation: String,
+    resource_type: String,
+}
+
+impl ScopeRequest {
+    /// Creates a new scope request with the given `operation` and `resource_type`.
+    ///
+    /// Subject attributes default to empty, which is fail-closed: a subject
+    /// with no attributes will only be granted access through an
+    /// `All`-matcher UA (see [`AttributeMatcher::All`] security note).
+    pub fn new(operation: impl Into<String>, resource_type: impl Into<String>) -> Self {
+        Self {
+            subject_attrs: HashMap::new(),
+            operation: operation.into(),
+            resource_type: resource_type.into(),
+        }
+    }
+
+    /// Sets the subject's attributes (consuming setter).
+    ///
+    /// Replaces the previously set (or default-empty) subject attribute map.
+    pub fn subject_attrs(self, attrs: HashMap<String, HashSet<String>>) -> Self {
+        Self {
+            subject_attrs: attrs,
+            ..self
+        }
+    }
+}
+
+/// One attribute constraint for list-query filter injection.
+///
+/// A constraint specifies that the resource must have a particular attribute
+/// key with a value matching one of the allowed values, translating to a SQL
+/// `key IN (values...)` predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeConstraint {
+    /// The resource's attribute `key` must have a value in `values`
+    /// (translates to SQL `key IN (values...)`).
+    Attribute {
+        /// The resource attribute key to filter on.
+        key: String,
+        /// The acceptable values for that key.
+        values: Vec<String>,
+    },
+}
+
+/// The resolved access scope for a `(subject, operation, resource_type)` triple.
+///
+/// Used to inject filters into list queries so that only authorized resources
+/// are returned. Translate the variants as follows:
+/// - [`Unrestricted`](AccessScope::Unrestricted): no `WHERE` clause; return all.
+/// - [`Constrained`](AccessScope::Constrained): inject the constraints as `WHERE` clauses.
+/// - [`None`](AccessScope::None): return an empty result set immediately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessScope {
+    /// No filter needed — the subject may access all resources of this type.
+    Unrestricted,
+    /// One or more attribute constraints defining the accessible subset.
+    ///
+    /// # Union semantics
+    ///
+    /// Constraints are a **union** (OR) of access paths, never an intersection.
+    /// Each [`ScopeConstraint`] represents an independent grant; the result set
+    /// is the *union* of resources matching *any* constraint. Multi-axis "AND"
+    /// policies (e.g., "org alpha AND low-sensitivity") are not expressible via
+    /// multiple associations and would inadvertently *broaden* access if attempted.
+    Constrained(Vec<ScopeConstraint>),
+    /// No access — the application should return an empty result set.
+    None,
+}
+
+/// Resolves the access scope for the subject described by `request` for
+/// list-query filter injection.
+///
+/// Returns an [`AccessScope`] that can be translated into a database filter.
+///
+/// # Algorithm (per D16, D17)
+///
+/// 1. Collect all UAs whose matcher matches `request.subject_attrs`.
+/// 2. For each UA, for each association from that UA:
+///    - Skip if the operation set does not contain the requested operation.
+///    - `ObjectAttribute(oa_id)` target: if the OA exists and its
+///      `resource_type` matches the request, push it onto `candidate_oas`.
+///      Skip dangling references (fail-closed, mirrors REQ-EVAL-005).
+///    - `PolicyClass(pc_id)` target: push **all** OAs assigned to the PC for
+///      the requested `resource_type` onto `candidate_oas` (D16 expansion).
+///      UA→PC is shorthand for "every OA under that PC", not god-mode.
+/// 3. If any candidate OA has `matcher == AttributeMatcher::All`, return
+///    `Unrestricted` immediately (D17 short-circuit: `X OR true = true`).
+/// 4. For each `Matching { key, values }` matcher (in candidate-first-seen
+///    order), group by `key` and union the `values` lists (deduplicating,
+///    preserving first-seen value order) → `ScopeConstraint::Attribute`.
+/// 5. Return `Constrained(constraints)` if any constraints were collected,
+///    otherwise `None`.
+pub fn scope(view: &impl PolicyView, request: &ScopeRequest) -> AccessScope {
+    let uas = view.matching_uas(&request.subject_attrs);
+
+    // Step 2: collect candidate OAs
+    let mut candidate_oas: Vec<&ObjectAttribute> = Vec::new();
+    for ua in uas {
+        for assoc in view.associations_for_ua(ua.id) {
+            if !assoc.operations.contains(&request.operation) {
+                continue;
+            }
+            match &assoc.target {
+                AssociationTarget::ObjectAttribute(oa_id) => {
+                    if let Some(oa) = view.get_oa(*oa_id)
+                        && oa.resource_type == request.resource_type
+                    {
+                        candidate_oas.push(oa);
+                    }
+                    // dangling OA reference — skip, fail-closed
+                }
+                AssociationTarget::PolicyClass(pc_id) => {
+                    candidate_oas.extend(view.oas_for_pc(*pc_id, &request.resource_type));
+                }
+            }
+        }
+    }
+
+    // Step 3: All-matcher short-circuit (D17)
+    if candidate_oas
+        .iter()
+        .any(|oa| oa.matcher == AttributeMatcher::All)
+    {
+        return AccessScope::Unrestricted;
+    }
+
+    // Step 4: merge Matching matchers by key (first-seen key order, union values)
+    let mut key_order: Vec<String> = Vec::new();
+    let mut key_values: HashMap<String, Vec<String>> = HashMap::new();
+
+    for oa in &candidate_oas {
+        if let AttributeMatcher::Matching { key, values } = &oa.matcher {
+            let entry = key_values.entry(key.clone()).or_insert_with(|| {
+                key_order.push(key.clone());
+                Vec::new()
+            });
+            for v in values {
+                if !entry.contains(v) {
+                    entry.push(v.clone());
+                }
+            }
+        }
+    }
+
+    // Step 5: build constraints or return None
+    if key_order.is_empty() {
+        AccessScope::None
+    } else {
+        let constraints = key_order
+            .into_iter()
+            .map(|k| {
+                let values = key_values.remove(&k).unwrap_or_default();
+                ScopeConstraint::Attribute { key: k, values }
+            })
+            .collect();
+        AccessScope::Constrained(constraints)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2535,6 +2713,588 @@ mod tests {
     fn decision_debug() {
         assert!(format!("{:?}", Decision::Allow).contains("Allow"));
         assert!(format!("{:?}", Decision::Deny).contains("Deny"));
+    }
+
+    // =========================================================
+    // Phase 4 — scope() tests (REQ-SCOPE-001…006, REQ-DOC-002)
+    // =========================================================
+
+    // ---- Fixture helpers ----
+
+    /// Builds the review-counterexample graph for scope() tests:
+    ///
+    /// - `ua`: All-matcher (any subject matches)
+    /// - `pc`: `org_alpha_pc`
+    /// - `oa`: `alpha_jobs` — `resource_type="job"`,
+    ///   `Matching { key: "org_id", values: ["alpha"] }`
+    /// - OA assigned to PC
+    /// - Association: `(ua.id → PC, {"read"})`
+    ///
+    /// Returns `(graph, ua_id, pc_id, oa_id)`.
+    fn scope_pc_graph() -> (PolicyGraph, Uuid, Uuid, Uuid) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "org_admins".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "org_alpha_pc".to_string(),
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        (graph, ua.id, pc.id, oa.id)
+    }
+
+    // ---- ScopeRequest type-shape tests (REQ-SCOPE-001) ----
+
+    /// `ScopeRequest::new` yields empty subject attrs and correct fields.
+    #[test]
+    fn scope_request_new_has_empty_subject_attrs() {
+        let req = ScopeRequest::new("read", "job");
+        assert_eq!(req.operation, "read");
+        assert_eq!(req.resource_type, "job");
+        assert!(req.subject_attrs.is_empty());
+    }
+
+    /// Consuming `subject_attrs` setter replaces the default-empty map.
+    #[test]
+    fn scope_request_subject_attrs_setter_works() {
+        let s = attrs(&[("org_id", &["alpha"])]);
+        let req = ScopeRequest::new("read", "job").subject_attrs(s.clone());
+        assert_eq!(req.subject_attrs, s);
+    }
+
+    // ---- ScopeConstraint / AccessScope type-shape tests (REQ-SCOPE-002) ----
+
+    #[test]
+    fn scope_constraint_attribute_equality() {
+        let c1 = ScopeConstraint::Attribute {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        };
+        let c2 = ScopeConstraint::Attribute {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        };
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn access_scope_variants_not_equal() {
+        assert_ne!(AccessScope::Unrestricted, AccessScope::None);
+        assert_ne!(AccessScope::Unrestricted, AccessScope::Constrained(vec![]));
+    }
+
+    // ---- scope() review counterexample (REQ-SCOPE-003, locked-in) ----
+
+    /// REQ-SCOPE-003 locked-in review counterexample:
+    /// `(org_admins, org_alpha_pc, {read})` with
+    /// `alpha_jobs { resource_type: "job", matcher: Matching { org_id \u2208 ["alpha"] } }`
+    /// assigned to the PC yields
+    /// `Constrained([Attribute { key: "org_id", values: ["alpha"] }])`,
+    /// **not** `Unrestricted`.
+    ///
+    /// This locks in D16 (UA→PC is OA expansion, not god-mode): the OA's
+    /// `Matching` matcher is preserved in the scope output.
+    #[test]
+    fn scope_review_counterexample_constrained_not_unrestricted() {
+        let (graph, _ua, _pc, _oa) = scope_pc_graph();
+        // Subject has org_id=beta but UA is All-matcher — subject matches the UA.
+        // The OA has Matching{org_id=["alpha"]} so scope is Constrained.
+        let req = ScopeRequest::new("read", "job").subject_attrs(attrs(&[("org_id", &["beta"])]));
+        let result = scope(&graph, &req);
+        assert_eq!(
+            result,
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            }])
+        );
+    }
+
+    // ---- scope() operation-absent and dangling-ref (REQ-SCOPE-003) ----
+
+    /// Associations whose operation set lacks the requested operation
+    /// contribute nothing; sole-path result is `None`.
+    #[test]
+    fn scope_operation_absent_returns_none() {
+        let (graph, _ua, _pc, _oa) = scope_pc_graph();
+        // Association has "read" but we request "write"
+        let req = ScopeRequest::new("write", "job").subject_attrs(attrs(&[("org_id", &["alpha"])]));
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    /// A dangling UA→OA reference contributes nothing; sole-path result is `None`.
+    #[test]
+    fn scope_dangling_oa_reference_returns_none() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "members".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        // Association points to an OA that was never added to the graph
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    // ---- scope() All-matcher short-circuit (REQ-SCOPE-004, D17) ----
+
+    /// `Unrestricted` via an `All`-matcher OA reached through a direct UA→OA
+    /// association (public-resources pattern).
+    #[test]
+    fn scope_unrestricted_via_all_oa_direct_ua_oa() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "public".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "public_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        assert_eq!(scope(&graph, &req), AccessScope::Unrestricted);
+    }
+
+    /// `Unrestricted` via an `All`-matcher OA assigned to a PC reached through
+    /// a UA→PC association (platform-admin pattern).
+    #[test]
+    fn scope_unrestricted_via_all_oa_under_pc() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "platform_admins".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "role".to_string(),
+                values: vec!["admin".to_string()],
+            },
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_pc".to_string(),
+        };
+        // All-matcher OA under the PC grants unrestricted job access
+        let oa_all = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "all_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa_all.clone());
+        graph.assign_oa_to_pc(oa_all.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job").subject_attrs(attrs(&[("role", &["admin"])]));
+        assert_eq!(scope(&graph, &req), AccessScope::Unrestricted);
+    }
+
+    /// A mix of one `All`-matcher OA and several `Matching` OAs still returns
+    /// `Unrestricted`, not `Constrained`.
+    #[test]
+    fn scope_mixed_all_and_matching_oa_returns_unrestricted() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa_alpha = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa_all = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "all_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa_alpha.clone());
+        graph.add_oa(oa_all.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_alpha.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_all.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        assert_eq!(scope(&graph, &req), AccessScope::Unrestricted);
+    }
+
+    // ---- scope() constraint merging (REQ-SCOPE-005) ----
+
+    /// Two OAs with `{ org_id \u2208 [alpha] }` and `{ org_id \u2208 [beta] }` merge into
+    /// one constraint `Attribute { key: "org_id", values: ["alpha", "beta"] }`.
+    #[test]
+    fn scope_same_key_values_merged_into_one_constraint() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "org_members".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa_alpha = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa_beta = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "beta_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["beta".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa_alpha.clone());
+        graph.add_oa(oa_beta.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_alpha.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_beta.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        let result = scope(&graph, &req);
+        // Extract the single constraint and verify values contain both orgs
+        if let AccessScope::Constrained(constraints) = result {
+            assert_eq!(constraints.len(), 1);
+            let ScopeConstraint::Attribute { key, values } = &constraints[0];
+            assert_eq!(key, "org_id");
+            // Both values must be present
+            assert!(values.contains(&"alpha".to_string()));
+            assert!(values.contains(&"beta".to_string()));
+            assert_eq!(values.len(), 2);
+        } else {
+            panic!("Expected Constrained, got {:?}", result);
+        }
+    }
+
+    /// Duplicate values across OAs are deduplicated in the merged constraint.
+    #[test]
+    fn scope_duplicate_values_deduped() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "members".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        // Both OAs include "alpha"; second also includes "beta"
+        let oa1 = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "oa1".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa2 = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "oa2".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string(), "beta".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa1.clone());
+        graph.add_oa(oa2.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa1.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa2.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        let result = scope(&graph, &req);
+        if let AccessScope::Constrained(constraints) = result {
+            assert_eq!(constraints.len(), 1);
+            let ScopeConstraint::Attribute { key, values } = &constraints[0];
+            assert_eq!(key, "org_id");
+            // alpha appears in both OAs but must only appear once
+            let alpha_count = values.iter().filter(|v| *v == "alpha").count();
+            assert_eq!(alpha_count, 1, "alpha should be deduplicated");
+            assert!(values.contains(&"beta".to_string()));
+            assert_eq!(values.len(), 2);
+        } else {
+            panic!("Expected Constrained, got {:?}", result);
+        }
+    }
+
+    /// Two OAs with distinct keys produce two separate OR-combined constraints.
+    #[test]
+    fn scope_distinct_keys_produce_two_constraints() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "members".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa_org = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "org_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa_team = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "team_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "team_id".to_string(),
+                values: vec!["engineering".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa_org.clone());
+        graph.add_oa(oa_team.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_org.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_team.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        let result = scope(&graph, &req);
+        if let AccessScope::Constrained(constraints) = result {
+            assert_eq!(
+                constraints.len(),
+                2,
+                "distinct keys produce two constraints"
+            );
+            let keys: Vec<&str> = constraints
+                .iter()
+                .map(|c| match c {
+                    ScopeConstraint::Attribute { key, .. } => key.as_str(),
+                })
+                .collect();
+            assert!(keys.contains(&"org_id"));
+            assert!(keys.contains(&"team_id"));
+        } else {
+            panic!("Expected Constrained, got {:?}", result);
+        }
+    }
+
+    /// Specific-object pattern: an OA with `{ key: "id", values: [resource_id] }`
+    /// yields `Constrained([Attribute { key: "id", values: [resource_id] }])`.
+    #[test]
+    fn scope_specific_object_id_constraint() {
+        let mut graph = PolicyGraph::new();
+        let resource_id = Uuid::new_v4().to_string();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "specific_user".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "specific_job".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "id".to_string(),
+                values: vec![resource_id.clone()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "job");
+        assert_eq!(
+            scope(&graph, &req),
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "id".to_string(),
+                values: vec![resource_id],
+            }])
+        );
+    }
+
+    // ---- scope() None cases (REQ-SCOPE-006) ----
+
+    /// `None` when no UA matches the subject attributes.
+    #[test]
+    fn scope_none_when_no_ua_matches() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_members".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Subject is in org "gamma" — no UA matches
+        let req = ScopeRequest::new("read", "job").subject_attrs(attrs(&[("org_id", &["gamma"])]));
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    /// `None` when the requested operation is not in any association.
+    #[test]
+    fn scope_none_when_operation_not_granted() {
+        let (graph, _ua, _pc, _oa) = scope_pc_graph();
+        // Graph only has "read"; request for "delete"
+        let req = ScopeRequest::new("delete", "job");
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    /// `None` when the resource type has no matching OAs (wrong type requested).
+    #[test]
+    fn scope_none_when_resource_type_has_no_oas() {
+        let (graph, _ua, _pc, _oa) = scope_pc_graph();
+        // Graph has OAs for "job" only; request for "document"
+        let req = ScopeRequest::new("read", "document");
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    /// `None` when a UA→PC association exists but the PC has no OAs of the
+    /// requested resource type.
+    #[test]
+    fn scope_none_when_pc_has_no_oas_of_resource_type() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_pc".to_string(),
+        };
+        // Only a "document" OA under the PC — no "job" OA
+        let oa_doc = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "all_docs".to_string(),
+            resource_type: "document".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa_doc.clone());
+        graph.assign_oa_to_pc(oa_doc.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Request for "job" resource type — PC only has "document" OAs
+        let req = ScopeRequest::new("read", "job");
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    // ---- AccessScope / ScopeConstraint derive tests (REQ-SCOPE-002) ----
+
+    #[test]
+    fn access_scope_debug() {
+        assert!(format!("{:?}", AccessScope::Unrestricted).contains("Unrestricted"));
+        assert!(format!("{:?}", AccessScope::None).contains("None"));
+    }
+
+    #[test]
+    fn access_scope_clone() {
+        let scope_val = AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        }]);
+        let cloned = scope_val.clone();
+        assert_eq!(scope_val, cloned);
+    }
+
+    #[test]
+    fn scope_constraint_debug() {
+        let c = ScopeConstraint::Attribute {
+            key: "org_id".to_string(),
+            values: vec!["alpha".to_string()],
+        };
+        assert!(format!("{:?}", c).contains("Attribute"));
+        assert!(format!("{:?}", c).contains("org_id"));
     }
 }
 

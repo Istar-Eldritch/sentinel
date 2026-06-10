@@ -58,7 +58,11 @@ same matching function works for both subject and resource sides.
 *R3 --- Policy Class Support*: PC nodes exist as top-level scope
 groupings. OA→PC assignments link object attributes to policy classes.
 Associations can target either OA or PC nodes. A UA→PC association
-with the required operation produces `AccessScope::Unrestricted`.
+behaves as shorthand for "every OA currently assigned to that PC" ---
+it expands the OAs' matchers into the scope output (D16). 
+`AccessScope::Unrestricted` is returned only when a reachable candidate
+OA carries `matcher: All` (D17); mere existence of OAs under a PC is
+not sufficient (amended 2026-06-10).
 
 *R4 --- Associations*: Permission grants are
 `(UA, target, HashSet<String>)` where target is either an OA or PC.
@@ -119,9 +123,10 @@ re-exports, providing a single dependency for consuming applications.
 - `evaluate()` correctly handles: allow via UA→OA association, allow
   via UA→PC association, deny when no matching association, deny when
   operation not in rights set
-- `scope()` correctly returns: `Unrestricted` for UA→PC associations,
-  `Constrained` with OR-combined attribute constraints for UA→OA
-  associations, `None` when no access
+- `scope()` correctly returns: `Unrestricted` when any reachable OA
+  carries `matcher: All` (D16, D17); `Constrained` with OR-combined
+  attribute constraints from `Matching` OAs (including those expanded
+  from UA→PC associations); `None` when no access path exists
 - `PolicyGraph` is epoch-free; `PolicyState` wraps it and implements
   epoch's aggregate state traits
 - Policy aggregate is working: commands produce events, events
@@ -438,17 +443,21 @@ pub enum ScopeConstraint {
 }
 ```
 
-*Algorithm:*
+*Algorithm (D16 expansion, D17 short-circuit):*
 
 + `view.matching_uas(subject_attrs)` --- find matching UAs
-+ Collect associations with the requested operation
-+ If any UA→PC association matches and
-  `view.oas_for_pc(pc_id, resource_type)` returns results ---
-  return `Unrestricted`
-+ Collect `AttributeMatcher` values from matching UA→OA associations
-  where `resource_type` matches
-+ Merge into `Vec<ScopeConstraint::Attribute>` (OR-combined)
-+ Return `Constrained(constraints)` or `None` if empty
++ Collect candidate OAs with the requested operation:
+  - UA→OA: if `get_oa(oa_id)` exists and `resource_type` matches, add OA
+  - UA→PC: add all of `oas_for_pc(pc_id, resource_type)` (D16 expansion;
+    a UA→PC association is *not* a god-mode grant --- it is shorthand
+    for the union of the PC's OA matchers)
+  - Skip dangling OA references (fail-closed)
++ If any candidate OA has `matcher == All` --- return `Unrestricted`
+  immediately (D17: `X OR true = true`)
++ Group remaining `Matching { key, values }` matchers by `key`
+  (first-seen order); union values per key, dedup preserving first-seen
+  order → `ScopeConstraint::Attribute` entries
++ Return `Constrained(constraints)` if non-empty, else `None`
 
 Multiple constraints are OR-combined: the application translates to
 `WHERE (key1 IN values1 OR key2 IN values2 ...)`.
@@ -698,6 +707,23 @@ refactor.
   [D15], [No wildcard access rights],
     [Fail-closed: new operations require explicit grants; prevents
      implicit security holes],
+  [D16], [UA→PC associations expand to the PC's OAs (Option B)],
+    [A UA→PC association is shorthand for "every OA currently assigned
+     to that PC" in both `evaluate()` and `scope()`. `scope()` was
+     previously specified to return `Unrestricted` on existence of OAs
+     under a PC --- this was a soundness bug (`evaluate()` kept the
+     OA-matcher check while `scope()` did not, breaking the invariant).
+     Under Option B, `scope()` OR-combines the OA matchers exactly as
+     for direct UA→OA associations. `Unrestricted` is *derived* from
+     an `All`-matcher OA (D17), not *declared* by targeting a PC.
+     Adopted 2026-06-10.],
+  [D17], [`All`-matcher OA short-circuits `scope()` to `Unrestricted`],
+    [In `scope()`, if any candidate OA (reachable via UA→OA or UA→PC
+     expansion) has `matcher == AttributeMatcher::All`, return
+     `Unrestricted` immediately. Rationale: `X OR true = true`. This
+     makes platform-admin (`All` OA under platform PC) and
+     public-resource (`All` UA → `All` OA) patterns correct without
+     special-casing. Adopted 2026-06-10.],
   [D18], [Request attributes are multi-valued sets (`HashMap<String, HashSet<String>>`)],
     [Both subject and resource attributes are multi-valued: each key maps
      to a `HashSet<String>`. Matching semantics become non-empty
