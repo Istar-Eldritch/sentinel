@@ -602,6 +602,18 @@ concurrency is not a bottleneck.
 `ScopeRequest` use builders so environmental/contextual attributes
 can be added later without breaking changes.
 
+*Audit-trail boundary*: Sentinel's event log records *policy* history
+only --- every command that creates a node, adds an assignment, or
+modifies an association is immutably stamped with an actor ID and
+timestamp. However, reconstructing the effective access for a specific
+subject at a past point in time ("what could Alice access on 1 June?"
+or "who had read access to this job last week?") additionally requires
+the consuming application's own membership and attribute history (role
+assignments, org memberships, etc.). Sentinel alone cannot answer
+historical per-subject effective-access queries; the application must
+correlate the policy event log with its own attribute changelog.
+(Added 2026-06-10, REQ-DOC-003.)
+
 == Integration Points
 
 *`epoch_core` dependency*: `sentinel_core` depends on `epoch_core`

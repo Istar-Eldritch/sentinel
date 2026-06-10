@@ -3298,4 +3298,375 @@ mod tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// REQ-INV-001 — evaluate()/scope() soundness invariant tests
+// ---------------------------------------------------------------------------
+
+/// Canonical pattern fixtures and the soundness invariant: for any
+/// `(subject, operation, resource_type)` triple, `scope_admits(scope(...), r)`
+/// iff `evaluate(..., r) == Allow` for every resource `r`.
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    // ------------------------------------------------------------------
+    // Shared helpers
+    // ------------------------------------------------------------------
+
+    /// Constructs a multi-valued attribute map from key/value-slice pairs.
+    fn attrs(pairs: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+        pairs
+            .iter()
+            .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))
+            .collect()
+    }
+
+    /// Returns `true` when `resource_attrs` is admitted by `s`.
+    ///
+    /// - [`AccessScope::Unrestricted`] → always `true`.
+    /// - [`AccessScope::None`] → always `false`.
+    /// - [`AccessScope::Constrained`] → `true` when *any* constraint's
+    ///   `values` share at least one element with the resource's value-set for
+    ///   `key` (D18 non-empty intersection semantics, mirroring
+    ///   [`AttributeMatcher::matches`]).
+    fn scope_admits(s: &AccessScope, resource_attrs: &HashMap<String, HashSet<String>>) -> bool {
+        match s {
+            AccessScope::Unrestricted => true,
+            AccessScope::None => false,
+            AccessScope::Constrained(constraints) => constraints.iter().any(|c| {
+                let ScopeConstraint::Attribute { key, values } = c;
+                resource_attrs
+                    .get(key)
+                    .is_some_and(|vs| vs.iter().any(|v| values.contains(v)))
+            }),
+        }
+    }
+
+    /// Asserts the soundness invariant for every resource in `resources`:
+    ///
+    /// `scope_admits(scope(graph, sreq), r)` ⟺ `evaluate(graph, areq) == Allow`
+    fn check_invariant(
+        graph: &PolicyGraph,
+        subject_attrs: &HashMap<String, HashSet<String>>,
+        operation: &str,
+        resource_type: &str,
+        resources: &[HashMap<String, HashSet<String>>],
+    ) {
+        let sreq = ScopeRequest::new(operation, resource_type).subject_attrs(subject_attrs.clone());
+        let s = scope(graph, &sreq);
+
+        for resource in resources {
+            let admitted = scope_admits(&s, resource);
+            let areq = AccessRequest::new(operation, resource_type)
+                .subject_attrs(subject_attrs.clone())
+                .resource_attrs(resource.clone());
+            let allowed = evaluate(graph, &areq) == Decision::Allow;
+            assert_eq!(
+                admitted,
+                allowed,
+                "Invariant violated for resource {:?}: \
+                 scope_admits={admitted}, evaluate=={}",
+                resource,
+                if allowed { "Allow" } else { "Deny" }
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 1: Platform admin — All OA under platform PC → Unrestricted
+    // ------------------------------------------------------------------
+
+    /// Builds a platform-admin graph: `All`-matcher UA associated with a
+    /// platform PC that owns an `All`-matcher OA for "job" resources.
+    fn platform_admin_graph() -> (PolicyGraph, HashMap<String, HashSet<String>>) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "platform_admins".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_pc".to_string(),
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "all_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Platform admins match `All` — empty subject attrs suffice.
+        (graph, attrs(&[]))
+    }
+
+    /// Pattern 1: platform admin via `All` OA under platform PC.
+    ///
+    /// Scope → `Unrestricted`; every job resource is admitted and
+    /// `evaluate` returns `Allow` — invariant holds.
+    #[test]
+    fn invariant_platform_admin() {
+        let (graph, subject) = platform_admin_graph();
+
+        let sreq = ScopeRequest::new("read", "job").subject_attrs(subject.clone());
+        assert_eq!(scope(&graph, &sreq), AccessScope::Unrestricted);
+
+        let resources = [
+            attrs(&[("org_id", &["alpha"])]),
+            attrs(&[("org_id", &["beta"])]),
+            attrs(&[("org_id", &["alpha", "beta"])]),
+            attrs(&[]),
+        ];
+        check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 2: Org-scoped admin — UA→PC, Matching OA → Constrained
+    // ------------------------------------------------------------------
+
+    /// Builds an org-scoped-admin graph: a `role=admin`-matcher UA associated
+    /// with an org PC that owns an `org_id=alpha`-matcher OA for "job".
+    fn org_scoped_admin_graph() -> (PolicyGraph, HashMap<String, HashSet<String>>) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "org_alpha_admins".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "role".to_string(),
+                values: vec!["admin".to_string()],
+            },
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "org_alpha_pc".to_string(),
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let subject = attrs(&[("role", &["admin"])]);
+        (graph, subject)
+    }
+
+    /// Pattern 2: org-scoped admin via UA→PC expansion (locked-in counterexample
+    /// from REQ-EVAL-004 / REQ-SCOPE-003).
+    ///
+    /// Scope → `Constrained([org_id ∈ ["alpha"]])` (not `Unrestricted`!);
+    /// alpha jobs admitted, beta jobs denied — both sides agree.
+    #[test]
+    fn invariant_org_scoped_admin() {
+        let (graph, subject) = org_scoped_admin_graph();
+
+        // Locked-in counterexample: UA→PC must NOT return Unrestricted
+        let sreq = ScopeRequest::new("read", "job").subject_attrs(subject.clone());
+        assert_eq!(
+            scope(&graph, &sreq),
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            }])
+        );
+
+        let resources = [
+            attrs(&[("org_id", &["alpha"])]),         // in-scope
+            attrs(&[("org_id", &["alpha", "beta"])]), // in-scope (D18: alpha present)
+            attrs(&[("org_id", &["beta"])]),          // out-of-scope
+            attrs(&[("org_id", &["gamma"])]),         // out-of-scope
+            attrs(&[]),                               // out-of-scope (no org_id)
+        ];
+        check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 3: Org member — direct UA→OA → Constrained
+    // ------------------------------------------------------------------
+
+    /// Builds an org-member graph: an `org_id=alpha`-matcher UA directly
+    /// associated with an `org_id=alpha`-matcher OA for "job" resources.
+    fn org_member_graph() -> (PolicyGraph, HashMap<String, HashSet<String>>) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_members".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let subject = attrs(&[("org_id", &["alpha"])]);
+        (graph, subject)
+    }
+
+    /// Pattern 3: org member via direct UA→OA association.
+    ///
+    /// Scope → `Constrained([org_id ∈ ["alpha"]])`;
+    /// alpha jobs admitted, beta jobs denied — both sides agree.
+    #[test]
+    fn invariant_org_member() {
+        let (graph, subject) = org_member_graph();
+
+        let sreq = ScopeRequest::new("read", "job").subject_attrs(subject.clone());
+        assert_eq!(
+            scope(&graph, &sreq),
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "org_id".to_string(),
+                values: vec!["alpha".to_string()],
+            }])
+        );
+
+        let resources = [
+            attrs(&[("org_id", &["alpha"])]),
+            attrs(&[("org_id", &["alpha", "beta"])]),
+            attrs(&[("org_id", &["beta"])]),
+            attrs(&[]),
+        ];
+        check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 4: Specific object — key:"id" OA matcher → Constrained
+    // ------------------------------------------------------------------
+
+    /// Pattern 4: specific-object access where the OA carries a
+    /// `key: "id"` matcher scoped to a single resource ID.
+    ///
+    /// Scope → `Constrained([id ∈ [target_id]])`;
+    /// the target job is admitted, all other jobs denied — both sides agree.
+    #[test]
+    fn invariant_specific_object() {
+        let target_id = "job-abc-123";
+        let other_id = "job-xyz-456";
+
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "specific_user".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "user_id".to_string(),
+                values: vec!["user-123".to_string()],
+            },
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "specific_job".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "id".to_string(),
+                values: vec![target_id.to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+
+        let subject = attrs(&[("user_id", &["user-123"])]);
+
+        let sreq = ScopeRequest::new("read", "job").subject_attrs(subject.clone());
+        assert_eq!(
+            scope(&graph, &sreq),
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "id".to_string(),
+                values: vec![target_id.to_string()],
+            }])
+        );
+
+        let resources = [
+            attrs(&[("id", &[target_id])]), // in-scope: the specific job
+            attrs(&[("id", &[other_id])]),  // out-of-scope: different job
+            attrs(&[]),                     // out-of-scope: no id key
+        ];
+        check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 5: Public resource — All UA → All OA → Unrestricted
+    // ------------------------------------------------------------------
+
+    /// Pattern 5: public-resource access — `All`-matcher UA directly
+    /// associated with an `All`-matcher OA.
+    ///
+    /// Scope → `Unrestricted`; every job is admitted and evaluates to `Allow`.
+    /// Empty subject attributes match the `All` UA (the unauthenticated sharp
+    /// edge documented on [`AttributeMatcher::All`]).
+    #[test]
+    fn invariant_public_resource() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "all_users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "public_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+
+        // Empty subject attrs — matches `All` (public / unauthenticated callers).
+        let subject = attrs(&[]);
+
+        let sreq = ScopeRequest::new("read", "job").subject_attrs(subject.clone());
+        assert_eq!(scope(&graph, &sreq), AccessScope::Unrestricted);
+
+        let resources = [
+            attrs(&[("org_id", &["alpha"])]),
+            attrs(&[("org_id", &["beta"])]),
+            attrs(&[]),
+        ];
+        check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+}
+
 pub mod aggregate;
