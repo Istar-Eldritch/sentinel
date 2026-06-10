@@ -80,6 +80,7 @@ pub enum PolicyEvent { UserAttributeCreated { .. }, ObjectAttributeCreated { .. 
 pub struct PolicyState { pub graph: PolicyGraph, version: u64 }  // implements EventApplicatorState + AggregateState
 
 pub enum PolicyApplyError {}          // uninhabited — apply is infallible
+                                      // ⚠️ Amended by D20 — see amendment note below; now inhabited
 pub enum PolicyCommandError { EventBuild(..), UserAttributeNotFound(Uuid),
     ObjectAttributeNotFound(Uuid), PolicyClassNotFound(Uuid) }
 

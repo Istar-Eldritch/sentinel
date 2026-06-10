@@ -2595,16 +2595,22 @@ mod tests {
     ///
     /// This locks in Option B (D16): UA→PC keeps the OA-matcher check;
     /// mere existence of OAs under a PC is NOT sufficient.
+    ///
+    /// # Why the UA uses `AttributeMatcher::All`
+    ///
+    /// The review counterexample described `org_admins` with
+    /// `Matching { org_id ∈ [alpha] }`. Using that matcher here would make the
+    /// beta-subject fail at the UA-matching stage rather than at the OA-matcher
+    /// check — meaning the test would pass vacuously without exercising the PC
+    /// branch at all. Using `All` ensures the subject *does* match the UA and
+    /// the deny must come from the OA-matcher check on the PC path, which is the
+    /// property being verified.
     #[test]
     fn evaluate_denies_review_counterexample_beta_job_under_alpha_pc() {
         let mut graph = PolicyGraph::new();
         let ua = UserAttribute {
             id: Uuid::new_v4(),
             name: "org_admins".to_string(),
-            // Subject has org_id="beta" — but that matches this Matching UA
-            // because the UA itself matches any alpha subjects. We need
-            // the subject to match the UA but the resource to fail the OA
-            // matcher. Use an All-matcher UA so any subject matches.
             matcher: AttributeMatcher::All,
         };
         let pc = PolicyClass {
@@ -3020,10 +3026,10 @@ mod tests {
             assert_eq!(constraints.len(), 1);
             let ScopeConstraint::Attribute { key, values } = &constraints[0];
             assert_eq!(key, "org_id");
-            // Both values must be present
-            assert!(values.contains(&"alpha".to_string()));
-            assert!(values.contains(&"beta".to_string()));
             assert_eq!(values.len(), 2);
+            // Assert first-seen order: oa_alpha association was added first.
+            assert_eq!(values[0], "alpha", "first-seen value must be first");
+            assert_eq!(values[1], "beta");
         } else {
             panic!("Expected Constrained, got {:?}", result);
         }
@@ -3076,11 +3082,11 @@ mod tests {
             assert_eq!(constraints.len(), 1);
             let ScopeConstraint::Attribute { key, values } = &constraints[0];
             assert_eq!(key, "org_id");
-            // alpha appears in both OAs but must only appear once
-            let alpha_count = values.iter().filter(|v| *v == "alpha").count();
-            assert_eq!(alpha_count, 1, "alpha should be deduplicated");
-            assert!(values.contains(&"beta".to_string()));
-            assert_eq!(values.len(), 2);
+            assert_eq!(values.len(), 2, "alpha should be deduplicated");
+            // Assert first-seen order: oa1 (alpha-only) was added first,
+            // then oa2 (alpha, beta) — alpha seen first, beta seen second.
+            assert_eq!(values[0], "alpha", "first-seen value must be first");
+            assert_eq!(values[1], "beta");
         } else {
             panic!("Expected Constrained, got {:?}", result);
         }
@@ -3134,14 +3140,15 @@ mod tests {
                 2,
                 "distinct keys produce two constraints"
             );
+            // Assert first-seen key order: oa_org association was added first.
             let keys: Vec<&str> = constraints
                 .iter()
                 .map(|c| match c {
                     ScopeConstraint::Attribute { key, .. } => key.as_str(),
                 })
                 .collect();
-            assert!(keys.contains(&"org_id"));
-            assert!(keys.contains(&"team_id"));
+            assert_eq!(keys[0], "org_id", "first-seen key must be first");
+            assert_eq!(keys[1], "team_id");
         } else {
             panic!("Expected Constrained, got {:?}", result);
         }
