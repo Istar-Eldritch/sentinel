@@ -707,6 +707,20 @@ refactor.
      The policy side (`Matching::values`) stays `Vec<String>` for
      serialisation stability. Amended from the original single-valued
      design during the 2026-06-10 review.],
+  [D19], [Association upsert identity on `(ua_id, target)`],
+    [`PolicyGraph::add_association` upserts: a second `CreateAssociation`
+     for the same `(ua_id, target)` pair replaces the existing entry —
+     the last event's operation set wins. This guarantees exactly one
+     association per pair and makes event-log replay coherent.
+     `CreateAssociation` means "set the operation set for this grant",
+     not "append a new grant". Adopted 2026-06-10.],
+  [D20], [`PolicyApplyError` is inhabited; `apply` fails closed on purged events],
+    [`PolicyApplyError` now has one variant: `MissingEventData(Uuid)`,
+     returned when an event's `data` field is `None` (purged event).
+     Policy-event purging is not supported; `apply` returns this error
+     rather than panicking, failing replay closed instead of silently
+     skipping the grant. Supersedes the original "infallible `apply`"
+     design. Adopted 2026-06-10.],
 )
 
 #hr()

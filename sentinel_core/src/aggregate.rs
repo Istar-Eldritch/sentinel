@@ -73,7 +73,12 @@ pub enum PolicyCommand {
         /// Human-readable name.
         name: String,
     },
-    /// Create a permission association from a UA to a target with operations.
+    /// Set the operation set for a permission association from a UA to a target.
+    ///
+    /// If an association for the same `(ua_id, target)` pair already exists,
+    /// it is replaced (upsert semantics, D19). The second `CreateAssociation`
+    /// for a pair becomes the canonical grant; replaying the event log is
+    /// therefore coherent even when the same pair appears multiple times.
     CreateAssociation {
         /// The user attribute this association originates from.
         ua_id: Uuid,
@@ -218,11 +223,17 @@ impl AggregateState for PolicyState {
 
 /// Error type for [`PolicyAggregate`]'s event application.
 ///
-/// This is an uninhabited enum — the [`EventApplicator::apply`] method
-/// delegates to infallible [`PolicyGraph`] mutation
-/// methods and can never fail.
+/// The only failure mode is a purged event whose `data` field is `None`.
+/// Sentinel does **not** support purging policy events; a missing-data event
+/// in the policy stream is treated as a hard error that fails replay closed
+/// rather than silently skipping the grant (D20).
 #[derive(Debug, thiserror::Error)]
-pub enum PolicyApplyError {}
+pub enum PolicyApplyError {
+    /// Event data is absent (purged event). Policy-event purging is not
+    /// supported; replay fails closed rather than skipping the grant.
+    #[error("Missing event data for event {0}")]
+    MissingEventData(Uuid),
+}
 
 /// Error type for [`PolicyAggregate`]'s command handling.
 #[derive(Debug, thiserror::Error)]
@@ -293,7 +304,11 @@ where
             graph: PolicyGraph::new(),
             version: 0,
         });
-        match event.data.as_ref().unwrap() {
+        match event
+            .data
+            .as_ref()
+            .ok_or(PolicyApplyError::MissingEventData(event.id))?
+        {
             PolicyEvent::UserAttributeCreated { id, name, matcher } => {
                 state.graph.add_ua(UserAttribute {
                     id: *id,
@@ -2082,5 +2097,105 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.get_version(), 3);
+    }
+
+    // =========================================================
+    // REQ-HARD-002 — association upsert replay coherence
+    // =========================================================
+
+    /// Replaying `AssociationCreated` for the same `(ua_id, target)` pair
+    /// upserts: exactly one association survives with the second event's
+    /// operation set. A subsequent `AssociationRemoved` removes it cleanly,
+    /// and sibling associations (different target) are unaffected.
+    #[tokio::test]
+    async fn apply_association_replay_coherence_upsert_and_remove() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_target = Uuid::new_v4();
+        let oa_sibling = Uuid::new_v4();
+
+        // Baseline state: sibling association on the same UA
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_sibling),
+            operations: HashSet::from(["admin".to_string()]),
+        });
+
+        // Event 1: create (ua_id, oa_target) with {read}
+        let ev1 = make_event(PolicyEvent::AssociationCreated {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_target),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let state1 = agg.apply(Some(state), &ev1).unwrap().unwrap();
+        let assocs1 = state1.graph.associations_for_ua(ua_id);
+        // Two total: sibling + new
+        assert_eq!(assocs1.len(), 2);
+
+        // Event 2: upsert (ua_id, oa_target) with {write, delete}
+        let ev2 = make_event(PolicyEvent::AssociationCreated {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_target),
+            operations: HashSet::from(["write".to_string(), "delete".to_string()]),
+        });
+        let state2 = agg.apply(Some(state1), &ev2).unwrap().unwrap();
+        let assocs2 = state2.graph.associations_for_ua(ua_id);
+        // Still two total (upsert replaced, not appended)
+        assert_eq!(assocs2.len(), 2);
+        // The oa_target association now has {write, delete}
+        let target_assoc = assocs2
+            .iter()
+            .find(|a| a.target == AssociationTarget::ObjectAttribute(oa_target))
+            .expect("target association must exist");
+        assert!(target_assoc.operations.contains("write"));
+        assert!(target_assoc.operations.contains("delete"));
+        assert!(!target_assoc.operations.contains("read"));
+        // Sibling is untouched
+        let sibling = assocs2
+            .iter()
+            .find(|a| a.target == AssociationTarget::ObjectAttribute(oa_sibling))
+            .expect("sibling association must exist");
+        assert!(sibling.operations.contains("admin"));
+
+        // Event 3: remove (ua_id, oa_target)
+        let ev3 = make_event(PolicyEvent::AssociationRemoved {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_target),
+        });
+        let state3 = agg.apply(Some(state2), &ev3).unwrap().unwrap();
+        let assocs3 = state3.graph.associations_for_ua(ua_id);
+        // Only sibling remains
+        assert_eq!(assocs3.len(), 1);
+        assert_eq!(
+            assocs3[0].target,
+            AssociationTarget::ObjectAttribute(oa_sibling)
+        );
+    }
+
+    // =========================================================
+    // REQ-HARD-003 — apply returns MissingEventData for purged events
+    // =========================================================
+
+    /// `apply` with an event whose `data` is `None` (purged event) must
+    /// return `Err(PolicyApplyError::MissingEventData(event.id))` — no panic.
+    #[tokio::test]
+    async fn apply_data_none_returns_missing_event_data_error() {
+        let agg = make_aggregate();
+        // Build a normal event, then simulate purging by setting data to None
+        let base = make_event(PolicyEvent::PolicyClassCreated {
+            id: Uuid::new_v4(),
+            name: "test_pc".to_string(),
+        });
+        let event_id = base.id;
+        let purged = Event { data: None, ..base };
+        let result = agg.apply(None, &purged);
+        assert!(
+            matches!(result, Err(PolicyApplyError::MissingEventData(id)) if id == event_id),
+            "expected MissingEventData({event_id}), got {result:?}"
+        );
     }
 }

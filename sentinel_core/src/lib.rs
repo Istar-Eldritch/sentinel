@@ -225,20 +225,28 @@ impl PolicyGraph {
         self.policy_classes.insert(pc.id, pc);
     }
 
-    /// Appends an association to the graph.
+    /// Upserts an association into the graph.
     ///
-    /// The association is added unconditionally — no duplicate checking
-    /// is performed. Validation (e.g., ensuring the UA and target exist)
-    /// is the responsibility of the aggregate command handler.
+    /// If an association with the same `(ua_id, target)` pair already exists,
+    /// it is **replaced** by the new entry — the second add's operation set
+    /// wins (D19 upsert semantics). This ensures exactly one association exists
+    /// per `(ua_id, target)` pair at all times, making event-log replay
+    /// coherent: replaying `AssociationCreated` for the same pair is
+    /// idempotent with respect to count.
+    ///
+    /// Validation (e.g., ensuring the UA and target exist) is the
+    /// responsibility of the aggregate command handler.
     pub fn add_association(&mut self, assoc: Association) {
+        self.associations
+            .retain(|a| !(a.ua_id == assoc.ua_id && a.target == assoc.target));
         self.associations.push(assoc);
     }
 
-    /// Removes all associations matching the given `ua_id` and `target`.
+    /// Removes the association matching the given `ua_id` and `target`.
     ///
-    /// Because [`Self::add_association`] appends without dedup, there may be
-    /// multiple matching entries (e.g., from duplicate commands); all are
-    /// removed. If no matching association exists, this is a no-op.
+    /// Because [`Self::add_association`] upserts (at most one entry per
+    /// `(ua_id, target)` pair), this removes at most one entry. If no
+    /// matching association exists, this is a no-op.
     pub fn remove_association(&mut self, ua_id: Uuid, target: &AssociationTarget) {
         self.associations
             .retain(|a| !(a.ua_id == ua_id && a.target == *target));
@@ -1102,34 +1110,37 @@ mod tests {
         assert_eq!(found[0].target, AssociationTarget::PolicyClass(pc_id));
     }
 
-    /// `add_association` uses `push()` with no dedup. Adding the exact same
-    /// association twice creates two entries. `remove_association` uses
-    /// `retain()` which removes *all* matching entries — so both are cleaned
-    /// up in one call. This test locks in that semantic contract.
+    /// Adding the exact same `(ua_id, target)` association twice upserts:
+    /// after the second add, exactly **one** association exists for the pair,
+    /// carrying the **second** operation set (D19 upsert semantics).
     #[test]
-    fn add_association_duplicate_creates_two_entries() {
+    fn add_association_duplicate_upserts_replacing_existing() {
         let mut graph = PolicyGraph::new();
         let ua_id = Uuid::new_v4();
         let oa_id = Uuid::new_v4();
-        let assoc = Association {
+        // First add: {read}
+        graph.add_association(Association {
             ua_id,
             target: AssociationTarget::ObjectAttribute(oa_id),
             operations: HashSet::from(["read".to_string()]),
-        };
-        graph.add_association(assoc.clone());
-        graph.add_association(assoc);
+        });
+        // Second add with same (ua_id, target): {write} — replaces, not appends
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["write".to_string()]),
+        });
         let found = graph.associations_for_ua(ua_id);
-        assert_eq!(found.len(), 2);
-        // remove_association should clean up both entries
-        graph.remove_association(ua_id, &AssociationTarget::ObjectAttribute(oa_id));
-        assert!(graph.associations_for_ua(ua_id).is_empty());
+        // Exactly one entry; second add's operation set wins
+        assert_eq!(found.len(), 1);
+        assert!(found[0].operations.contains("write"));
+        assert!(!found[0].operations.contains("read"));
     }
 
-    /// Adding two associations with the same (ua_id, target) but different
-    /// operations creates two separate entries — `add_association` appends
-    /// unconditionally and does NOT merge or replace.
+    /// Two adds with same `(ua_id, target)` but different operations upsert:
+    /// exactly one entry remains; the second operation set wins.
     #[test]
-    fn add_association_same_target_different_ops_creates_two() {
+    fn add_association_same_target_upserts_second_wins() {
         let mut graph = PolicyGraph::new();
         let ua_id = Uuid::new_v4();
         let oa_id = Uuid::new_v4();
@@ -1144,7 +1155,10 @@ mod tests {
             operations: HashSet::from(["write".to_string()]),
         });
         let found = graph.associations_for_ua(ua_id);
-        assert_eq!(found.len(), 2);
+        // Upsert: exactly one entry; second operation set wins
+        assert_eq!(found.len(), 1);
+        assert!(found[0].operations.contains("write"));
+        assert!(!found[0].operations.contains("read"));
     }
 
     // --- remove_association tests ---

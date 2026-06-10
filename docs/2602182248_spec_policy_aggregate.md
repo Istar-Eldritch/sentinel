@@ -109,3 +109,41 @@ impl<ES, SS> PolicyAggregate<ES, SS> {
 - UA→UA, OA→OA, PC→PC hierarchy
 - Node removal commands (`remove_ua`, `remove_oa`, `remove_pc`)
 - Hierarchical administration (who can modify the policy graph)
+
+---
+
+## Amendment Note — 2026-06-10 (D19 & D20)
+
+Two design decisions made during the PEP implementation review (delivery plan
+`2606100232`) supersede claims in this spec:
+
+### D19 — Association Upsert Identity
+
+**Supersedes:** the "Commands Mirror Events 1:1" table entry for `CreateAssociation`
+and the "Infallible `apply`" section's implication that duplicate events are
+harmless.
+
+`PolicyGraph::add_association` now upserts on `(ua_id, target)`: if an
+association for the same pair already exists, it is replaced by the new
+entry — the last `AssociationCreated` event wins. This ensures exactly one
+association per `(ua_id, target)` pair at all times, making event-log replay
+coherent. The `CreateAssociation` command's intent is therefore "set the
+operation set for this grant", not "append a new grant".
+
+### D20 — `PolicyApplyError` is Inhabited
+
+**Supersedes:** the "Infallible `apply`" section and the
+`pub enum PolicyApplyError {}` (uninhabited) claim in the Core API block.
+
+`PolicyApplyError` now has one variant:
+
+```rust
+pub enum PolicyApplyError {
+    MissingEventData(Uuid),
+}
+```
+
+If an event's `data` field is `None` (purged event), `apply` returns
+`Err(PolicyApplyError::MissingEventData(event.id))` rather than panicking.
+Policy-event purging is not supported; replay fails closed rather than
+silently skipping the grant.
