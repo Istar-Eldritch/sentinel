@@ -108,6 +108,21 @@ pub enum PolicyCommand {
         /// The policy class to unassign from.
         pc_id: Uuid,
     },
+    /// Delete a user attribute node and cascade-remove all dependent edges.
+    DeleteUserAttribute {
+        /// The ID of the user attribute to delete.
+        id: Uuid,
+    },
+    /// Delete an object attribute node and cascade-remove all dependent edges.
+    DeleteObjectAttribute {
+        /// The ID of the object attribute to delete.
+        id: Uuid,
+    },
+    /// Delete a policy class node and cascade-remove all dependent edges.
+    DeletePolicyClass {
+        /// The ID of the policy class to delete.
+        id: Uuid,
+    },
 }
 
 /// Events emitted by the policy aggregate.
@@ -177,6 +192,21 @@ pub enum PolicyEvent {
         oa_id: Uuid,
         /// The policy class that was unassigned from.
         pc_id: Uuid,
+    },
+    /// A user attribute node was deleted.
+    UserAttributeDeleted {
+        /// The ID of the deleted user attribute.
+        id: Uuid,
+    },
+    /// An object attribute node was deleted.
+    ObjectAttributeDeleted {
+        /// The ID of the deleted object attribute.
+        id: Uuid,
+    },
+    /// A policy class node was deleted.
+    PolicyClassDeleted {
+        /// The ID of the deleted policy class.
+        id: Uuid,
     },
 }
 
@@ -355,6 +385,15 @@ where
             PolicyEvent::OaUnassignedFromPc { oa_id, pc_id } => {
                 state.graph.unassign_oa_from_pc(*oa_id, *pc_id);
             }
+            PolicyEvent::UserAttributeDeleted { id } => {
+                state.graph.remove_ua(*id);
+            }
+            PolicyEvent::ObjectAttributeDeleted { id } => {
+                state.graph.remove_oa(*id);
+            }
+            PolicyEvent::PolicyClassDeleted { id } => {
+                state.graph.remove_pc(*id);
+            }
         }
         Ok(Some(state))
     }
@@ -482,6 +521,36 @@ where
                     return Err(PolicyCommandError::PolicyClassNotFound(pc_id));
                 }
                 PolicyEvent::OaUnassignedFromPc { oa_id, pc_id }
+            }
+            PolicyCommand::DeleteUserAttribute { id } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::UserAttributeNotFound(id))?
+                    .graph;
+                if !graph.user_attributes.contains_key(&id) {
+                    return Err(PolicyCommandError::UserAttributeNotFound(id));
+                }
+                PolicyEvent::UserAttributeDeleted { id }
+            }
+            PolicyCommand::DeleteObjectAttribute { id } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::ObjectAttributeNotFound(id))?
+                    .graph;
+                if !graph.object_attributes.contains_key(&id) {
+                    return Err(PolicyCommandError::ObjectAttributeNotFound(id));
+                }
+                PolicyEvent::ObjectAttributeDeleted { id }
+            }
+            PolicyCommand::DeletePolicyClass { id } => {
+                let graph = &state
+                    .as_ref()
+                    .ok_or(PolicyCommandError::PolicyClassNotFound(id))?
+                    .graph;
+                if !graph.policy_classes.contains_key(&id) {
+                    return Err(PolicyCommandError::PolicyClassNotFound(id));
+                }
+                PolicyEvent::PolicyClassDeleted { id }
             }
         };
 
@@ -2197,5 +2266,504 @@ mod tests {
             matches!(result, Err(PolicyApplyError::MissingEventData(id)) if id == event_id),
             "expected MissingEventData({event_id}), got {result:?}"
         );
+    }
+
+    // =========================================================
+    // PolicyCommand — delete variants constructible
+    // =========================================================
+
+    #[test]
+    fn policy_command_delete_variants_constructible() {
+        let id = Uuid::new_v4();
+        let _ = PolicyCommand::DeleteUserAttribute { id };
+        let _ = PolicyCommand::DeleteObjectAttribute { id };
+        let _ = PolicyCommand::DeletePolicyClass { id };
+    }
+
+    #[test]
+    fn policy_command_delete_ua_serde_roundtrip() {
+        let cmd = PolicyCommand::DeleteUserAttribute { id: Uuid::new_v4() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let deserialized: PolicyCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+    }
+
+    #[test]
+    fn policy_command_delete_oa_serde_roundtrip() {
+        let cmd = PolicyCommand::DeleteObjectAttribute { id: Uuid::new_v4() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let deserialized: PolicyCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+    }
+
+    #[test]
+    fn policy_command_delete_pc_serde_roundtrip() {
+        let cmd = PolicyCommand::DeletePolicyClass { id: Uuid::new_v4() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let deserialized: PolicyCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+    }
+
+    // =========================================================
+    // PolicyEvent — deleted variants
+    // =========================================================
+
+    #[test]
+    fn policy_event_deleted_variants_event_type() {
+        let id = Uuid::new_v4();
+        let ua_event = PolicyEvent::UserAttributeDeleted { id };
+        assert_eq!(ua_event.event_type(), "UserAttributeDeleted");
+        let oa_event = PolicyEvent::ObjectAttributeDeleted { id };
+        assert_eq!(oa_event.event_type(), "ObjectAttributeDeleted");
+        let pc_event = PolicyEvent::PolicyClassDeleted { id };
+        assert_eq!(pc_event.event_type(), "PolicyClassDeleted");
+    }
+
+    #[test]
+    fn policy_event_deleted_variants_serde_roundtrip() {
+        let id = Uuid::new_v4();
+        for event in [
+            PolicyEvent::UserAttributeDeleted { id },
+            PolicyEvent::ObjectAttributeDeleted { id },
+            PolicyEvent::PolicyClassDeleted { id },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let deserialized: PolicyEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+        }
+    }
+
+    // =========================================================
+    // EventApplicator::apply — delete events
+    // =========================================================
+
+    #[tokio::test]
+    async fn apply_user_attribute_deleted_removes_ua() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_ua(UserAttribute {
+            id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        assert!(state.graph.user_attributes.contains_key(&id));
+
+        let event = make_event(PolicyEvent::UserAttributeDeleted { id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(!state.graph.user_attributes.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn apply_user_attribute_deleted_cascades_associations() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        assert_eq!(state.graph.associations_for_ua(ua_id).len(), 1);
+
+        let event = make_event(PolicyEvent::UserAttributeDeleted { id: ua_id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(state.graph.associations_for_ua(ua_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_object_attribute_deleted_removes_oa() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_oa(ObjectAttribute {
+            id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        assert!(state.graph.object_attributes.contains_key(&id));
+
+        let event = make_event(PolicyEvent::ObjectAttributeDeleted { id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(!state.graph.object_attributes.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn apply_object_attribute_deleted_cascades_associations_and_assignments() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "platform".to_string(),
+        });
+        state.graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        state.graph.assign_oa_to_pc(oa_id, pc_id);
+
+        let event = make_event(PolicyEvent::ObjectAttributeDeleted { id: oa_id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(!state.graph.object_attributes.contains_key(&oa_id));
+        assert!(state.graph.associations_for_ua(ua_id).is_empty());
+        assert!(state.graph.oas_for_pc(pc_id, "job").is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_policy_class_deleted_removes_pc() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_pc(PolicyClass {
+            id,
+            name: "platform".to_string(),
+        });
+        assert!(state.graph.policy_classes.contains_key(&id));
+
+        let event = make_event(PolicyEvent::PolicyClassDeleted { id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(!state.graph.policy_classes.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn apply_policy_class_deleted_cascades_associations_and_assignments() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let mut state = PolicyState {
+            graph: PolicyGraph::new(),
+            version: 0,
+        };
+        state.graph.add_ua(UserAttribute {
+            id: ua_id,
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_oa(ObjectAttribute {
+            id: oa_id,
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        state.graph.add_pc(PolicyClass {
+            id: pc_id,
+            name: "platform".to_string(),
+        });
+        state.graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::PolicyClass(pc_id),
+            operations: HashSet::from(["admin".to_string()]),
+        });
+        state.graph.assign_oa_to_pc(oa_id, pc_id);
+
+        let event = make_event(PolicyEvent::PolicyClassDeleted { id: pc_id });
+        let state = agg.apply(Some(state), &event).unwrap().unwrap();
+        assert!(!state.graph.policy_classes.contains_key(&pc_id));
+        // Association targeting the PC is removed
+        assert!(state.graph.associations_for_ua(ua_id).is_empty());
+        // OA→PC assignment is removed; OA itself still exists
+        assert!(state.graph.object_attributes.contains_key(&oa_id));
+        assert!(state.graph.oas_for_pc(pc_id, "job").is_empty());
+    }
+
+    // =========================================================
+    // handle_command — delete commands (happy path)
+    // =========================================================
+
+    #[tokio::test]
+    async fn handle_delete_ua_produces_event() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::DeleteUserAttribute { id: ua_id });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "UserAttributeDeleted");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::UserAttributeDeleted { id } => assert_eq!(*id, ua_id),
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_delete_oa_produces_event() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::DeleteObjectAttribute { id: oa_id });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "ObjectAttributeDeleted");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::ObjectAttributeDeleted { id } => assert_eq!(*id, oa_id),
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_delete_pc_produces_event() {
+        let agg = make_aggregate();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        let state = state_with_ua_oa_pc(ua_id, oa_id, pc_id);
+
+        let command = cmd(PolicyCommand::DeletePolicyClass { id: pc_id });
+        let events = agg.handle_command(&state, command).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "PolicyClassDeleted");
+        match events[0].data.as_ref().unwrap() {
+            PolicyEvent::PolicyClassDeleted { id } => assert_eq!(*id, pc_id),
+            _ => panic!("unexpected event variant"),
+        }
+    }
+
+    // =========================================================
+    // handle_command — delete commands (error paths)
+    // =========================================================
+
+    #[tokio::test]
+    async fn handle_delete_ua_against_none_state_returns_not_found() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::DeleteUserAttribute { id });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::UserAttributeNotFound(eid) if eid == id),
+            "expected UserAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_delete_oa_against_none_state_returns_not_found() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::DeleteObjectAttribute { id });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(eid) if eid == id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_delete_pc_against_none_state_returns_not_found() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::DeletePolicyClass { id });
+        let err = agg.handle_command(&None, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::PolicyClassNotFound(eid) if eid == id),
+            "expected PolicyClassNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_delete_ua_missing_id_returns_not_found() {
+        let agg = make_aggregate();
+        let mut graph = PolicyGraph::new();
+        graph.add_pc(PolicyClass {
+            id: Uuid::new_v4(),
+            name: "test_pc".to_string(),
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+        let missing_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::DeleteUserAttribute { id: missing_id });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::UserAttributeNotFound(id) if id == missing_id),
+            "expected UserAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_delete_oa_missing_id_returns_not_found() {
+        let agg = make_aggregate();
+        let mut graph = PolicyGraph::new();
+        graph.add_pc(PolicyClass {
+            id: Uuid::new_v4(),
+            name: "test_pc".to_string(),
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+        let missing_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::DeleteObjectAttribute { id: missing_id });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::ObjectAttributeNotFound(id) if id == missing_id),
+            "expected ObjectAttributeNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_delete_pc_missing_id_returns_not_found() {
+        let agg = make_aggregate();
+        let mut graph = PolicyGraph::new();
+        graph.add_ua(UserAttribute {
+            id: Uuid::new_v4(),
+            name: "test_ua".to_string(),
+            matcher: AttributeMatcher::All,
+        });
+        let state = Some(PolicyState { graph, version: 1 });
+        let missing_id = Uuid::new_v4();
+        let command = cmd(PolicyCommand::DeletePolicyClass { id: missing_id });
+        let err = agg.handle_command(&state, command).await.unwrap_err();
+        assert!(
+            matches!(err, PolicyCommandError::PolicyClassNotFound(id) if id == missing_id),
+            "expected PolicyClassNotFound, got: {err:?}"
+        );
+    }
+
+    // =========================================================
+    // handle_command — delete commands (round-trip via handle)
+    // =========================================================
+
+    #[tokio::test]
+    async fn delete_ua_round_trip_removes_node_from_graph() {
+        let agg = make_aggregate();
+        let actor = Some(PolicyActor { id: Uuid::new_v4() });
+        let ua_id = Uuid::new_v4();
+
+        agg.handle(Command::new(
+            POLICY_AGGREGATE_ID,
+            PolicyCommand::CreateUserAttribute {
+                id: ua_id,
+                name: "admins".to_string(),
+                matcher: AttributeMatcher::All,
+            },
+            actor.clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::DeleteUserAttribute { id: ua_id },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!state.graph.user_attributes.contains_key(&ua_id));
+        assert!(
+            state
+                .graph
+                .matching_uas(&std::collections::HashMap::new())
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_oa_round_trip_removes_node_from_graph() {
+        let agg = make_aggregate();
+        let actor = Some(PolicyActor { id: Uuid::new_v4() });
+        let oa_id = Uuid::new_v4();
+
+        agg.handle(Command::new(
+            POLICY_AGGREGATE_ID,
+            PolicyCommand::CreateObjectAttribute {
+                id: oa_id,
+                name: "alpha_jobs".to_string(),
+                resource_type: "job".to_string(),
+                matcher: AttributeMatcher::All,
+            },
+            actor.clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::DeleteObjectAttribute { id: oa_id },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!state.graph.object_attributes.contains_key(&oa_id));
+        assert!(state.graph.get_oa(oa_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_pc_round_trip_removes_node_from_graph() {
+        let agg = make_aggregate();
+        let actor = Some(PolicyActor { id: Uuid::new_v4() });
+        let pc_id = Uuid::new_v4();
+
+        agg.handle(Command::new(
+            POLICY_AGGREGATE_ID,
+            PolicyCommand::CreatePolicyClass {
+                id: pc_id,
+                name: "platform".to_string(),
+            },
+            actor.clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::DeletePolicyClass { id: pc_id },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!state.graph.policy_classes.contains_key(&pc_id));
     }
 }
