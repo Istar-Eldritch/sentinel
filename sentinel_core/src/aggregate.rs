@@ -285,40 +285,68 @@ pub enum PolicyCommandError {
     PolicyClassNotFound(Uuid),
 }
 
+/// Default snapshot capture/retention policy for [`PolicyAggregate`].
+///
+/// Captures a snapshot every 50 versions and retains the most recent 5. Policy
+/// streams are small (hundreds of events), so this keeps reconstruction fast
+/// without unbounded snapshot growth.
+fn default_snapshot_config() -> SnapshotConfig {
+    SnapshotConfig {
+        trigger: SnapshotTrigger::Automatic { interval: 50 },
+        retention: SnapshotRetention::KeepLast(5),
+    }
+}
+
 /// The event-sourced policy aggregate.
 ///
-/// Generic over the event store (`ES`) and state store (`SS`) backends,
-/// so the consuming application or tests supply the concrete implementations.
+/// Generic over the event store (`ES`), state store (`SS`), and snapshot store
+/// (`SNS`) backends, so the consuming application or tests supply the concrete
+/// implementations.
 ///
 /// # Example (with in-memory backends for testing)
 ///
 /// ```ignore
-/// use epoch_mem::{InMemoryEventBus, InMemoryEventStore, InMemoryStateStore};
+/// use epoch_mem::{
+///     InMemoryEventBus, InMemoryEventStore, InMemorySnapshotStore, InMemoryStateStore,
+/// };
 ///
 /// let bus = InMemoryEventBus::<PolicyEvent>::new();
 /// let event_store = InMemoryEventStore::new(bus);
 /// let state_store = InMemoryStateStore::<PolicyState>::new();
-/// let aggregate = PolicyAggregate::new(event_store, state_store);
+/// let snapshot_store = InMemorySnapshotStore::<PolicyState>::new();
+/// let aggregate = PolicyAggregate::new(event_store, state_store, snapshot_store);
 /// ```
-pub struct PolicyAggregate<ES, SS> {
+pub struct PolicyAggregate<ES, SS, SNS> {
     event_store: ES,
     state_store: SS,
+    snapshot_store: SNS,
+    snapshot_config: SnapshotConfig,
 }
 
-impl<ES, SS> PolicyAggregate<ES, SS> {
-    /// Creates a new `PolicyAggregate` with the given event and state stores.
-    pub fn new(event_store: ES, state_store: SS) -> Self {
+impl<ES, SS, SNS> PolicyAggregate<ES, SS, SNS> {
+    /// Creates a new `PolicyAggregate` with the given event, state, and snapshot
+    /// stores and the [default snapshot config](default_snapshot_config).
+    pub fn new(event_store: ES, state_store: SS, snapshot_store: SNS) -> Self {
         Self {
             event_store,
             state_store,
+            snapshot_store,
+            snapshot_config: default_snapshot_config(),
         }
+    }
+
+    /// Overrides the snapshot capture/retention config.
+    pub fn with_snapshot_config(mut self, config: SnapshotConfig) -> Self {
+        self.snapshot_config = config;
+        self
     }
 }
 
-impl<ES, SS> EventApplicator<PolicyEvent> for PolicyAggregate<ES, SS>
+impl<ES, SS, SNS> EventApplicator<PolicyEvent> for PolicyAggregate<ES, SS, SNS>
 where
     ES: EventStoreBackend<EventType = PolicyEvent> + Send + Sync + Clone + 'static,
     SS: StateStoreBackend<PolicyState> + Send + Sync + Clone,
+    SNS: SnapshotStore<PolicyState> + Send + Sync + Clone,
 {
     type State = PolicyState;
     type StateStore = SS;
@@ -404,10 +432,11 @@ where
 }
 
 #[async_trait]
-impl<ES, SS> Aggregate<PolicyEvent> for PolicyAggregate<ES, SS>
+impl<ES, SS, SNS> Aggregate<PolicyEvent> for PolicyAggregate<ES, SS, SNS>
 where
     ES: EventStoreBackend<EventType = PolicyEvent> + Send + Sync + Clone + 'static,
     SS: StateStoreBackend<PolicyState> + Send + Sync + Clone,
+    SNS: SnapshotStore<PolicyState> + Send + Sync + Clone,
 {
     type CommandData = PolicyCommand;
     type CommandCredentials = PolicyActor;
@@ -563,6 +592,34 @@ where
         let event = builder.build()?;
         Ok(vec![event])
     }
+
+    async fn after_persist(
+        &self,
+        stream_id: Uuid,
+        new_version: u64,
+        events_applied: usize,
+        state: &PolicyState,
+    ) {
+        self.capture_snapshot_if_due(stream_id, new_version, events_applied, state)
+            .await;
+    }
+}
+
+impl<ES, SS, SNS> SnapshottingAggregate<PolicyEvent> for PolicyAggregate<ES, SS, SNS>
+where
+    ES: EventStoreBackend<EventType = PolicyEvent> + Send + Sync + Clone + 'static,
+    SS: StateStoreBackend<PolicyState> + Send + Sync + Clone,
+    SNS: SnapshotStore<PolicyState> + Send + Sync + Clone,
+{
+    type SnapshotStore = SNS;
+
+    fn snapshot_store(&self) -> SNS {
+        self.snapshot_store.clone()
+    }
+
+    fn snapshot_config(&self) -> &SnapshotConfig {
+        &self.snapshot_config
+    }
 }
 
 #[cfg(test)]
@@ -570,7 +627,9 @@ mod tests {
     use super::*;
     use crate::{Association, ObjectAttribute, PolicyClass, PolicyView, UserAttribute};
 
-    use epoch_mem::{InMemoryEventBus, InMemoryEventStore, InMemoryStateStore};
+    use epoch_mem::{
+        InMemoryEventBus, InMemoryEventStore, InMemorySnapshotStore, InMemoryStateStore,
+    };
     use tokio_stream::StreamExt;
 
     // =========================================================
@@ -917,7 +976,67 @@ mod tests {
         let bus = InMemoryEventBus::<PolicyEvent>::new();
         let event_store = InMemoryEventStore::new(bus);
         let state_store = InMemoryStateStore::<PolicyState>::new();
-        let _aggregate = PolicyAggregate::new(event_store, state_store);
+        let snapshot_store = InMemorySnapshotStore::<PolicyState>::new();
+        let _aggregate = PolicyAggregate::new(event_store, state_store, snapshot_store);
+    }
+
+    #[tokio::test]
+    async fn snapshot_captured_at_configured_interval() {
+        let bus = InMemoryEventBus::<PolicyEvent>::new();
+        let event_store = InMemoryEventStore::new(bus);
+        let state_store = InMemoryStateStore::<PolicyState>::new();
+        let snapshot_store = InMemorySnapshotStore::<PolicyState>::new();
+        let agg = PolicyAggregate::new(event_store, state_store, snapshot_store.clone())
+            .with_snapshot_config(SnapshotConfig {
+                trigger: SnapshotTrigger::Automatic { interval: 3 },
+                retention: SnapshotRetention::KeepLast(5),
+            });
+
+        // Two commands (versions 1, 2): no interval-3 boundary crossed yet.
+        for i in 0..2 {
+            agg.handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateUserAttribute {
+                    id: Uuid::new_v4(),
+                    name: format!("ua{i}"),
+                    matcher: AttributeMatcher::All,
+                },
+                Some(PolicyActor { id: Uuid::new_v4() }),
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            snapshot_store
+                .load_snapshot(POLICY_AGGREGATE_ID, 2)
+                .await
+                .unwrap()
+                .is_none(),
+            "no snapshot before crossing the interval boundary"
+        );
+
+        // Third command (version 3) crosses the interval-3 boundary: capture.
+        agg.handle(Command::new(
+            POLICY_AGGREGATE_ID,
+            PolicyCommand::CreateUserAttribute {
+                id: Uuid::new_v4(),
+                name: "ua2".to_string(),
+                matcher: AttributeMatcher::All,
+            },
+            Some(PolicyActor { id: Uuid::new_v4() }),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let snap = snapshot_store
+            .load_snapshot(POLICY_AGGREGATE_ID, 3)
+            .await
+            .unwrap()
+            .expect("snapshot captured at the interval boundary");
+        assert_eq!(snap.version, 3);
+        assert_eq!(snap.state.graph.user_attributes.len(), 3);
     }
 
     // =========================================================
@@ -927,13 +1046,15 @@ mod tests {
     type TestAggregate = PolicyAggregate<
         InMemoryEventStore<InMemoryEventBus<PolicyEvent>>,
         InMemoryStateStore<PolicyState>,
+        InMemorySnapshotStore<PolicyState>,
     >;
 
     fn make_aggregate() -> TestAggregate {
         let bus = InMemoryEventBus::<PolicyEvent>::new();
         let event_store = InMemoryEventStore::new(bus);
         let state_store = InMemoryStateStore::<PolicyState>::new();
-        PolicyAggregate::new(event_store, state_store)
+        let snapshot_store = InMemorySnapshotStore::<PolicyState>::new();
+        PolicyAggregate::new(event_store, state_store, snapshot_store)
     }
 
     /// Build an `Event<PolicyEvent>` with the given data for use in `apply` tests.
