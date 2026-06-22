@@ -45,8 +45,18 @@ where
     ES::Error: 'static,
     SNS::Error: 'static,
 {
-    /// Returns the `stream_version` of the last policy event whose `created_at`
-    /// is at or before `t`, or `None` if no event exists at or before `t`.
+    /// Returns the highest `stream_version` `V` such that *every* event in the
+    /// prefix `[1, V]` has `created_at <= t`, or `None` when the first event
+    /// already postdates `t`.
+    ///
+    /// Reconstruction is prefix-based (snapshot + bounded replay up to a
+    /// version), so the only sound translation is the longest contiguous prefix
+    /// that fully precedes `t`. epoch's event store guarantees ascending
+    /// `stream_version` order but *not* `created_at` monotonicity, so we stop at
+    /// the first event after `t` rather than taking the max matching version:
+    /// an out-of-order event (clock skew) must never pull a later-timestamped
+    /// event into a historical view, which would be a fail-open violation of the
+    /// soundness invariant.
     ///
     /// This is the timestamp → version translation that underpins
     /// [`policy_at`](Self::policy_at).
@@ -63,10 +73,10 @@ where
         let mut version: Option<u64> = None;
         while let Some(item) = stream.next().await {
             let event = item.map_err(|e| TimeTravelError::EventStore(Box::new(e)))?;
-            if event.created_at <= t {
-                version =
-                    Some(version.map_or(event.stream_version, |v| v.max(event.stream_version)));
+            if event.created_at > t {
+                break;
             }
+            version = Some(event.stream_version);
         }
         Ok(version)
     }
@@ -533,6 +543,33 @@ mod tests {
                 "soundness violated for {resource:?}: scope_admits={admitted}, allowed={allowed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn out_of_order_timestamp_does_not_pull_in_future_events() {
+        // epoch guarantees ascending stream_version, not created_at monotonicity.
+        // A higher-version event with an earlier timestamp must not cause an
+        // intervening future-timestamped event to be included in the view.
+        let agg = make_aggregate();
+        let early = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let future = early + Duration::seconds(1_000);
+        let late = early + Duration::seconds(10);
+
+        // v1 @ early, v2 @ future (out-of-order: postdates v3), v3 @ late.
+        agg.get_event_store()
+            .store_events(vec![
+                ua_event("first", 1, early),
+                ua_event("second", 2, future),
+                ua_event("third", 3, late),
+            ])
+            .await
+            .unwrap();
+
+        // Querying at `late`: only the contiguous prefix [v1] fully precedes it,
+        // because v2 (the next event) postdates `late`. v3 must not be pulled in.
+        assert_eq!(agg.policy_version_at(late).await.unwrap(), Some(1));
+        let graph = agg.policy_at(late).await.unwrap().unwrap();
+        assert_eq!(graph.user_attributes.len(), 1);
     }
 
     #[tokio::test]
