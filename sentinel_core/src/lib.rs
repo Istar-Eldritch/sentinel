@@ -277,6 +277,39 @@ impl PolicyGraph {
     pub fn unassign_oa_from_pc(&mut self, oa_id: Uuid, pc_id: Uuid) {
         self.oa_pc_assignments.remove(&(oa_id, pc_id));
     }
+
+    /// Removes a user attribute from the graph and cascades to dependent edges.
+    ///
+    /// All associations where `ua_id == id` are also removed. Deleting a UA
+    /// that does not exist is a no-op.
+    pub fn remove_ua(&mut self, id: Uuid) {
+        self.user_attributes.remove(&id);
+        self.associations.retain(|a| a.ua_id != id);
+    }
+
+    /// Removes an object attribute from the graph and cascades to dependent edges.
+    ///
+    /// All associations targeting this OA and all `oa_pc_assignments` entries
+    /// where `oa_id == id` are also removed. Deleting an OA that does not
+    /// exist is a no-op.
+    pub fn remove_oa(&mut self, id: Uuid) {
+        self.object_attributes.remove(&id);
+        self.associations
+            .retain(|a| a.target != AssociationTarget::ObjectAttribute(id));
+        self.oa_pc_assignments.retain(|(oa_id, _)| *oa_id != id);
+    }
+
+    /// Removes a policy class from the graph and cascades to dependent edges.
+    ///
+    /// All associations targeting this PC and all `oa_pc_assignments` entries
+    /// where `pc_id == id` are also removed. Deleting a PC that does not
+    /// exist is a no-op.
+    pub fn remove_pc(&mut self, id: Uuid) {
+        self.policy_classes.remove(&id);
+        self.associations
+            .retain(|a| a.target != AssociationTarget::PolicyClass(id));
+        self.oa_pc_assignments.retain(|(_, pc_id)| *pc_id != id);
+    }
 }
 
 impl Default for PolicyGraph {
@@ -1673,6 +1706,283 @@ mod tests {
         let oas = graph.oas_for_pc(pc.id, "job");
         assert_eq!(oas.len(), 1);
         assert_eq!(oas[0].id, oa2.id);
+    }
+
+    // --- remove_ua tests ---
+
+    #[test]
+    fn remove_ua_removes_user_attribute() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "admins".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.remove_ua(ua.id);
+        assert!(graph.matching_uas(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn remove_ua_cascades_to_associations() {
+        let mut graph = PolicyGraph::new();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.remove_ua(ua_id);
+        assert!(graph.associations_for_ua(ua_id).is_empty());
+    }
+
+    #[test]
+    fn remove_ua_cascade_leaves_other_ua_associations_intact() {
+        let mut graph = PolicyGraph::new();
+        let ua_id1 = Uuid::new_v4();
+        let ua_id2 = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        graph.add_association(Association {
+            ua_id: ua_id1,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id: ua_id2,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["write".to_string()]),
+        });
+        graph.remove_ua(ua_id1);
+        assert!(graph.associations_for_ua(ua_id1).is_empty());
+        assert_eq!(graph.associations_for_ua(ua_id2).len(), 1);
+    }
+
+    #[test]
+    fn remove_ua_noop_when_not_found() {
+        let mut graph = PolicyGraph::new();
+        graph.remove_ua(Uuid::new_v4()); // must not panic
+        assert!(graph.matching_uas(&HashMap::new()).is_empty());
+    }
+
+    // --- remove_oa tests ---
+
+    #[test]
+    fn remove_oa_removes_object_attribute() {
+        let mut graph = PolicyGraph::new();
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_oa(oa.clone());
+        graph.remove_oa(oa.id);
+        assert!(graph.get_oa(oa.id).is_none());
+    }
+
+    #[test]
+    fn remove_oa_cascades_to_associations() {
+        let mut graph = PolicyGraph::new();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.remove_oa(oa_id);
+        assert!(graph.associations_for_ua(ua_id).is_empty());
+    }
+
+    #[test]
+    fn remove_oa_cascade_leaves_other_oa_associations_intact() {
+        let mut graph = PolicyGraph::new();
+        let ua_id = Uuid::new_v4();
+        let oa_id1 = Uuid::new_v4();
+        let oa_id2 = Uuid::new_v4();
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id1),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::ObjectAttribute(oa_id2),
+            operations: HashSet::from(["write".to_string()]),
+        });
+        graph.remove_oa(oa_id1);
+        let found = graph.associations_for_ua(ua_id);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target, AssociationTarget::ObjectAttribute(oa_id2));
+    }
+
+    #[test]
+    fn remove_oa_cascades_to_oa_pc_assignments() {
+        let mut graph = PolicyGraph::new();
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_policy".to_string(),
+        };
+        graph.add_oa(oa.clone());
+        graph.add_pc(pc.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.remove_oa(oa.id);
+        assert!(graph.oas_for_pc(pc.id, "job").is_empty());
+    }
+
+    #[test]
+    fn remove_oa_cascade_leaves_other_oa_assignments_intact() {
+        let mut graph = PolicyGraph::new();
+        let oa1 = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa2 = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "beta_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_policy".to_string(),
+        };
+        graph.add_oa(oa1.clone());
+        graph.add_oa(oa2.clone());
+        graph.add_pc(pc.clone());
+        graph.assign_oa_to_pc(oa1.id, pc.id);
+        graph.assign_oa_to_pc(oa2.id, pc.id);
+        graph.remove_oa(oa1.id);
+        let oas = graph.oas_for_pc(pc.id, "job");
+        assert_eq!(oas.len(), 1);
+        assert_eq!(oas[0].id, oa2.id);
+    }
+
+    #[test]
+    fn remove_oa_noop_when_not_found() {
+        let mut graph = PolicyGraph::new();
+        graph.remove_oa(Uuid::new_v4()); // must not panic
+    }
+
+    // --- remove_pc tests ---
+
+    #[test]
+    fn remove_pc_removes_policy_class() {
+        let mut graph = PolicyGraph::new();
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_policy".to_string(),
+        };
+        graph.add_oa(oa.clone());
+        graph.add_pc(pc.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.remove_pc(pc.id);
+        // oas_for_pc uses the assignment set; if PC is gone, no OAs returned
+        assert!(graph.oas_for_pc(pc.id, "job").is_empty());
+    }
+
+    #[test]
+    fn remove_pc_cascades_to_associations() {
+        let mut graph = PolicyGraph::new();
+        let ua_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::PolicyClass(pc_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.remove_pc(pc_id);
+        assert!(graph.associations_for_ua(ua_id).is_empty());
+    }
+
+    #[test]
+    fn remove_pc_cascade_leaves_other_pc_associations_intact() {
+        let mut graph = PolicyGraph::new();
+        let ua_id = Uuid::new_v4();
+        let pc_id1 = Uuid::new_v4();
+        let pc_id2 = Uuid::new_v4();
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::PolicyClass(pc_id1),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id,
+            target: AssociationTarget::PolicyClass(pc_id2),
+            operations: HashSet::from(["write".to_string()]),
+        });
+        graph.remove_pc(pc_id1);
+        let found = graph.associations_for_ua(ua_id);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target, AssociationTarget::PolicyClass(pc_id2));
+    }
+
+    #[test]
+    fn remove_pc_cascades_to_oa_pc_assignments() {
+        let mut graph = PolicyGraph::new();
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_policy".to_string(),
+        };
+        graph.add_oa(oa.clone());
+        graph.add_pc(pc.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.remove_pc(pc.id);
+        assert!(graph.oas_for_pc(pc.id, "job").is_empty());
+    }
+
+    #[test]
+    fn remove_pc_cascade_leaves_other_pc_assignments_intact() {
+        let mut graph = PolicyGraph::new();
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "alpha_jobs".to_string(),
+            resource_type: "job".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc1 = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "org_policy".to_string(),
+        };
+        let pc2 = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "platform_policy".to_string(),
+        };
+        graph.add_oa(oa.clone());
+        graph.add_pc(pc1.clone());
+        graph.add_pc(pc2.clone());
+        graph.assign_oa_to_pc(oa.id, pc1.id);
+        graph.assign_oa_to_pc(oa.id, pc2.id);
+        graph.remove_pc(pc1.id);
+        assert!(graph.oas_for_pc(pc1.id, "job").is_empty());
+        assert_eq!(graph.oas_for_pc(pc2.id, "job").len(), 1);
+    }
+
+    #[test]
+    fn remove_pc_noop_when_not_found() {
+        let mut graph = PolicyGraph::new();
+        graph.remove_pc(Uuid::new_v4()); // must not panic
     }
 
     // --- PolicyGraph serde roundtrip with data ---
