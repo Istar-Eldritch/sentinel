@@ -4031,14 +4031,23 @@ mod proptest_invariant_tests {
         }
     }
 
-    /// Arbitrary short attribute key from a small alphabet.
+    /// Arbitrary attribute key from a small fixed pool (ensures frequent collisions
+    /// between matcher keys, subject attrs, and resource attrs).
     fn arb_attr_key() -> impl Strategy<Value = String> {
-        "[a-z]{1,4}".prop_map(|s| s)
+        prop::sample::select(vec!["k1".to_string(), "k2".to_string(), "k3".to_string()])
     }
 
-    /// Arbitrary short attribute value from a small alphabet.
+    /// Arbitrary attribute value from a small fixed pool.
     fn arb_attr_value() -> impl Strategy<Value = String> {
-        "[a-z]{1,4}".prop_map(|s| s)
+        prop::sample::select(vec!["v1".to_string(), "v2".to_string(), "v3".to_string()])
+    }
+
+    fn arb_operation() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["op1".to_string(), "op2".to_string()])
+    }
+
+    fn arb_resource_type() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["res1".to_string(), "res2".to_string()])
     }
 
     /// Arbitrary multi-valued attribute map (0–3 keys, 0–3 values each).
@@ -4062,93 +4071,132 @@ mod proptest_invariant_tests {
         ]
     }
 
-    /// Generates a coherent policy graph: 0–3 UAs, 0–3 OAs (all
-    /// `resource_type: "res"`), an optional PC, and associations/assignments
-    /// that only ever reference real node IDs.
-    fn arb_graph() -> impl Strategy<Value = PolicyGraph> {
+    /// Generates a coherent policy graph plus the operation and resource_type used
+    /// for all OA nodes and associations, so the test can issue matching requests.
+    ///
+    /// Occasionally emits associations pointing at non-existent nodes to exercise
+    /// the fail-closed dangling-reference path in `evaluate`/`scope`.
+    fn arb_graph() -> impl Strategy<Value = (PolicyGraph, String, String)> {
         (
             prop::collection::vec(arb_matcher(), 0..=3),
             prop::collection::vec(arb_matcher(), 0..=3),
             any::<bool>(),
+            // stride 3 == max(0..=3); max index = 2*3+2 = 8 < 9
             prop::collection::vec(any::<bool>(), 9),
             prop::collection::vec(any::<bool>(), 3),
             prop::collection::vec(any::<bool>(), 3),
+            any::<bool>(), // add_dangling_oa
+            any::<bool>(), // add_dangling_pc
+            arb_operation(),
+            arb_resource_type(),
         )
-            .prop_map(|(ua_matchers, oa_matchers, has_pc, ua_oa, oa_pc, ua_pc)| {
-                let mut graph = PolicyGraph::new();
-                let ua_ids: Vec<Uuid> = ua_matchers.iter().map(|_| Uuid::new_v4()).collect();
-                let oa_ids: Vec<Uuid> = oa_matchers.iter().map(|_| Uuid::new_v4()).collect();
+            .prop_map(
+                |(
+                    ua_matchers,
+                    oa_matchers,
+                    has_pc,
+                    ua_oa,
+                    oa_pc,
+                    ua_pc,
+                    add_dangling_oa,
+                    add_dangling_pc,
+                    operation,
+                    resource_type,
+                )| {
+                    let mut graph = PolicyGraph::new();
+                    let ua_ids: Vec<Uuid> = ua_matchers.iter().map(|_| Uuid::new_v4()).collect();
+                    let oa_ids: Vec<Uuid> = oa_matchers.iter().map(|_| Uuid::new_v4()).collect();
 
-                for (i, m) in ua_matchers.into_iter().enumerate() {
-                    graph.add_ua(UserAttribute {
-                        id: ua_ids[i],
-                        name: format!("ua{i}"),
-                        matcher: m,
-                    });
-                }
-                for (j, m) in oa_matchers.into_iter().enumerate() {
-                    graph.add_oa(ObjectAttribute {
-                        id: oa_ids[j],
-                        name: format!("oa{j}"),
-                        resource_type: "res".to_string(),
-                        matcher: m,
-                    });
-                }
+                    for (i, m) in ua_matchers.into_iter().enumerate() {
+                        graph.add_ua(UserAttribute {
+                            id: ua_ids[i],
+                            name: format!("ua{i}"),
+                            matcher: m,
+                        });
+                    }
+                    for (j, m) in oa_matchers.into_iter().enumerate() {
+                        graph.add_oa(ObjectAttribute {
+                            id: oa_ids[j],
+                            name: format!("oa{j}"),
+                            resource_type: resource_type.clone(),
+                            matcher: m,
+                        });
+                    }
 
-                let pc_id = Uuid::new_v4();
-                if has_pc {
-                    graph.add_pc(PolicyClass {
-                        id: pc_id,
-                        name: "pc".to_string(),
-                    });
-                    for (j, &oid) in oa_ids.iter().enumerate() {
-                        if oa_pc[j] {
-                            graph.assign_oa_to_pc(oid, pc_id);
+                    let pc_id = Uuid::new_v4();
+                    if has_pc {
+                        graph.add_pc(PolicyClass {
+                            id: pc_id,
+                            name: "pc".to_string(),
+                        });
+                        for (j, &oid) in oa_ids.iter().enumerate() {
+                            if oa_pc[j] {
+                                graph.assign_oa_to_pc(oid, pc_id);
+                            }
                         }
                     }
-                }
 
-                for (i, &uid) in ua_ids.iter().enumerate() {
-                    for (j, &oid) in oa_ids.iter().enumerate() {
-                        if ua_oa[i * 3 + j] {
+                    for (i, &uid) in ua_ids.iter().enumerate() {
+                        for (j, &oid) in oa_ids.iter().enumerate() {
+                            if ua_oa[i * 3 + j] {
+                                graph.add_association(Association {
+                                    ua_id: uid,
+                                    target: AssociationTarget::ObjectAttribute(oid),
+                                    operations: HashSet::from([operation.clone()]),
+                                });
+                            }
+                        }
+                        if has_pc && ua_pc[i] {
                             graph.add_association(Association {
                                 ua_id: uid,
-                                target: AssociationTarget::ObjectAttribute(oid),
-                                operations: HashSet::from(["op".to_string()]),
+                                target: AssociationTarget::PolicyClass(pc_id),
+                                operations: HashSet::from([operation.clone()]),
                             });
                         }
                     }
-                    if has_pc && ua_pc[i] {
-                        graph.add_association(Association {
-                            ua_id: uid,
-                            target: AssociationTarget::PolicyClass(pc_id),
-                            operations: HashSet::from(["op".to_string()]),
-                        });
-                    }
-                }
 
-                graph
-            })
+                    // Occasionally add dangling associations (non-existent target IDs)
+                    // to exercise the fail-closed path in evaluate/scope.
+                    if add_dangling_oa {
+                        if let Some(&uid) = ua_ids.first() {
+                            graph.add_association(Association {
+                                ua_id: uid,
+                                target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
+                                operations: HashSet::from([operation.clone()]),
+                            });
+                        }
+                    }
+                    if add_dangling_pc {
+                        if let Some(&uid) = ua_ids.first() {
+                            graph.add_association(Association {
+                                ua_id: uid,
+                                target: AssociationTarget::PolicyClass(Uuid::new_v4()),
+                                operations: HashSet::from([operation.clone()]),
+                            });
+                        }
+                    }
+
+                    (graph, operation, resource_type)
+                },
+            )
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
         /// For any generated graph, subject, and resource, `scope` admits the
         /// resource exactly when `evaluate` allows it.
         #[test]
         fn soundness_invariant_holds(
-            graph in arb_graph(),
+            (graph, operation, resource_type) in arb_graph(),
             subject in arb_attr_map(),
             resource in arb_attr_map(),
         ) {
-            let operation = "op";
-            let resource_type = "res";
-
-            let sreq = ScopeRequest::new(operation, resource_type)
+            let sreq = ScopeRequest::new(&operation, &resource_type)
                 .subject_attrs(subject.clone());
             let s = scope(&graph, &sreq);
             let admitted = scope_admits(&s, &resource);
 
-            let areq = AccessRequest::new(operation, resource_type)
+            let areq = AccessRequest::new(&operation, &resource_type)
                 .subject_attrs(subject)
                 .resource_attrs(resource.clone());
             let allowed = evaluate(&graph, &areq) == Decision::Allow;
