@@ -16,6 +16,8 @@ Sentinel inverts the design: the matcher language is deliberately restricted so 
 - A resource admitted by `scope` constraints is **guaranteed** to be allowed by `evaluate`, and vice versa.
 - This agreement is a **tested invariant**, not a best-effort claim. Property-based tests sweep arbitrary graph configurations and assert the biconditional holds for all of them.
 
+The matcher vocabulary has three variants: `All` (wildcard — matches any resource), `Matching { key, values }` (value-set membership — `resource[key] ∩ values ≠ ∅`), and `Relative { resource_key, subject_key }` (co-membership — `resource[resource_key] ∩ subject[subject_key] ≠ ∅`, useful for same-org or same-team constraints without enumerating values in the policy graph).
+
 *Give up Turing-complete policy expressiveness; gain provably exact query filters.* No shipping engine offers this as a guarantee.
 
 ### 2. Time-travel authorization
