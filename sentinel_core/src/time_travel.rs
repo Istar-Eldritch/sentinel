@@ -8,6 +8,18 @@
 //! [`policy_at_version`] reconstruct the [`PolicyGraph`] at that point via
 //! epoch's `state_at` (nearest snapshot + bounded replay).
 //!
+//! ## Clock-skew and under-reporting
+//!
+//! Timestamp→version translation uses the longest **contiguous prefix** of
+//! events whose `created_at ≤ t` (see [`policy_version_at`]). This is the
+//! fail-closed guarantee: an out-of-order (clock-skewed) event at version `k`
+//! with a future timestamp terminates the prefix at `k-1`, so all queries
+//! whose target time falls between the real event time and the skewed timestamp
+//! will see the policy as of version `k-1` — hiding legitimately committed
+//! later policy. This is the safe direction for authorization audits, but
+//! operators should be aware that skewed clocks can make historical views
+//! shorter than reality.
+//!
 //! [`policy_version_at`]: PolicyAggregate::policy_version_at
 //! [`policy_at`]: PolicyAggregate::policy_at
 //! [`policy_at_version`]: PolicyAggregate::policy_at_version
@@ -57,6 +69,12 @@ where
     /// an out-of-order event (clock skew) must never pull a later-timestamped
     /// event into a historical view, which would be a fail-open violation of the
     /// soundness invariant.
+    ///
+    /// **Performance:** this always performs a full O(n) scan of the event
+    /// stream (via `read_events_range(.., None, None)`). The translation is
+    /// intentionally not snapshot-accelerated — snapshots record state, not
+    /// timestamps, so there is no shortcut. At the stated scale of hundreds of
+    /// policy events this is fine.
     ///
     /// This is the timestamp → version translation that underpins
     /// [`policy_at`](Self::policy_at).
@@ -126,6 +144,12 @@ where
     /// dispatches to the unchanged [`evaluate`]. Returns [`Decision::Deny`]
     /// (fail-closed) when `t` predates the first policy event — the graph did
     /// not exist, so nothing is authorized.
+    ///
+    /// **Reconstruction cost:** each call reconstructs the full graph. If you
+    /// need to evaluate many requests at the same `t`, call [`policy_at`] once
+    /// and pass the returned graph directly to [`evaluate`] instead.
+    ///
+    /// [`policy_at`]: Self::policy_at
     pub async fn evaluate_at(
         &self,
         t: DateTime<Utc>,
@@ -142,6 +166,13 @@ where
     /// Reconstructs the graph once via [`policy_at`](Self::policy_at) and
     /// dispatches to the unchanged [`scope`]. Returns [`AccessScope::None`]
     /// (fail-closed) when `t` predates the first policy event.
+    ///
+    /// **Reconstruction cost:** each call reconstructs the full graph. If you
+    /// need to resolve scope for many requests at the same `t`, call
+    /// [`policy_at`] once and pass the returned graph directly to [`scope`]
+    /// instead.
+    ///
+    /// [`policy_at`]: Self::policy_at
     pub async fn scope_at(
         &self,
         t: DateTime<Utc>,
@@ -162,7 +193,7 @@ mod tests {
     use std::collections::HashSet;
 
     use chrono::{Duration, TimeZone};
-    use epoch_core::prelude::{Command, Event};
+    use epoch_core::prelude::{Command, Event, SnapshotConfig, SnapshotRetention, SnapshotTrigger};
     use epoch_mem::{
         InMemoryEventBus, InMemoryEventStore, InMemorySnapshotStore, InMemoryStateStore,
     };
@@ -594,5 +625,111 @@ mod tests {
                 .unwrap(),
             Decision::Deny
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_backed_reconstruction() {
+        // Verifies that policy_at_version composes correctly with a snapshot
+        // start-state (snapshot + bounded replay) rather than always doing a
+        // full replay from version 1.
+        let bus = InMemoryEventBus::<PolicyEvent>::new();
+        let event_store = InMemoryEventStore::new(bus);
+        let state_store = InMemoryStateStore::<PolicyState>::new();
+        let snapshot_store = InMemorySnapshotStore::<PolicyState>::new();
+        let agg = PolicyAggregate::new(event_store, state_store, snapshot_store.clone())
+            .with_snapshot_config(SnapshotConfig {
+                trigger: SnapshotTrigger::Automatic { interval: 3 },
+                retention: SnapshotRetention::KeepLast(5),
+            });
+
+        // Drive 5 commands (versions 1–5); interval=3 fires a snapshot at v3.
+        for i in 0..5usize {
+            agg.handle(create_ua_command(&format!("ua{i}")))
+                .await
+                .unwrap();
+        }
+
+        // A snapshot must have been captured at the interval boundary (v3).
+        let snap = snapshot_store
+            .load_snapshot(POLICY_AGGREGATE_ID, 3)
+            .await
+            .unwrap()
+            .expect("snapshot captured at version 3 interval boundary");
+        assert_eq!(snap.version, 3);
+        assert_eq!(snap.state.graph.user_attributes.len(), 3);
+
+        // Reconstruct at v5 — uses snapshot @ v3 + bounded replay of v4, v5.
+        let graph = agg
+            .policy_at_version(5)
+            .await
+            .unwrap()
+            .expect("graph exists at version 5");
+        assert_eq!(graph.user_attributes.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn node_deletion_across_time() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let t2 = t1 + Duration::seconds(100);
+        let ua_id = Uuid::new_v4();
+
+        agg.get_event_store()
+            .store_events(vec![
+                event_at(
+                    PolicyEvent::UserAttributeCreated {
+                        id: ua_id,
+                        name: "temp_ua".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    1,
+                    t1,
+                ),
+                event_at(PolicyEvent::UserAttributeDeleted { id: ua_id }, 2, t2),
+            ])
+            .await
+            .unwrap();
+
+        let before = agg
+            .policy_at(t1 + Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("graph present before deletion");
+        assert_eq!(
+            before.user_attributes.len(),
+            1,
+            "node present before deletion"
+        );
+
+        let after = agg
+            .policy_at(t2 + Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("graph present after deletion");
+        assert_eq!(after.user_attributes.len(), 0, "node gone after deletion");
+    }
+
+    #[tokio::test]
+    async fn exact_timestamp_boundary_is_inclusive() {
+        // created_at > t means t == created_at includes that event.
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        agg.get_event_store()
+            .store_events(vec![ua_event("first", 1, t1)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            agg.policy_version_at(t1).await.unwrap(),
+            Some(1),
+            "event at exactly t1 is included (boundary is inclusive)"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_stream_returns_none() {
+        let agg = make_aggregate();
+        assert_eq!(agg.policy_version_at(Utc::now()).await.unwrap(), None);
+        assert!(agg.policy_at(Utc::now()).await.unwrap().is_none());
     }
 }
