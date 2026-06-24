@@ -2268,18 +2268,6 @@ mod tests {
         );
     }
 
-    // =========================================================
-    // PolicyCommand — delete variants constructible
-    // =========================================================
-
-    #[test]
-    fn policy_command_delete_variants_constructible() {
-        let id = Uuid::new_v4();
-        let _ = PolicyCommand::DeleteUserAttribute { id };
-        let _ = PolicyCommand::DeleteObjectAttribute { id };
-        let _ = PolicyCommand::DeletePolicyClass { id };
-    }
-
     #[test]
     fn policy_command_delete_ua_serde_roundtrip() {
         let cmd = PolicyCommand::DeleteUserAttribute { id: Uuid::new_v4() };
@@ -2660,6 +2648,63 @@ mod tests {
     // =========================================================
     // handle_command — delete commands (round-trip via handle)
     // =========================================================
+
+    #[tokio::test]
+    async fn delete_ua_round_trip_cascades_associations() {
+        let agg = make_aggregate();
+        let actor = Some(PolicyActor { id: Uuid::new_v4() });
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+
+        for cmd_payload in [
+            PolicyCommand::CreateUserAttribute {
+                id: ua_id,
+                name: "admins".to_string(),
+                matcher: AttributeMatcher::All,
+            },
+            PolicyCommand::CreateObjectAttribute {
+                id: oa_id,
+                name: "alpha_jobs".to_string(),
+                resource_type: "job".to_string(),
+                matcher: AttributeMatcher::All,
+            },
+        ] {
+            agg.handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                cmd_payload,
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+        agg.handle(Command::new(
+            POLICY_AGGREGATE_ID,
+            PolicyCommand::CreateAssociation {
+                ua_id,
+                target: AssociationTarget::ObjectAttribute(oa_id),
+                operations: HashSet::from(["read".to_string()]),
+            },
+            actor.clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::DeleteUserAttribute { id: ua_id },
+                actor.clone(),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!state.graph.user_attributes.contains_key(&ua_id));
+        assert!(state.graph.associations_for_ua(ua_id).is_empty());
+    }
 
     #[tokio::test]
     async fn delete_ua_round_trip_removes_node_from_graph() {
