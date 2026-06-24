@@ -70,6 +70,18 @@ This table covers only the dimensions where sentinel makes a specific claim. For
 | `sentinel_derive` | Proc macros for policy enforcement annotations |
 | `sentinel` | Facade crate with feature-gated re-exports |
 
+## Examples
+
+- [`org-scoped-access.rs`](sentinel/examples/org-scoped-access.rs) — Multi-tenant org isolation with `Matching`: employees read jobs within their own organisation. Shows `evaluate()` and `scope()`.
+- [`ownership.rs`](sentinel/examples/ownership.rs) — Per-record ownership with `Relative`: users read and delete their own documents. No user IDs stored in the policy graph — the constraint resolves from live request attributes.
+
+Run an example:
+
+```sh
+cargo run --example org-scoped-access
+cargo run --example ownership
+```
+
 ## Status
 
 Early development. See `docs/` for design documents and `specs/` for implementation specifications.
