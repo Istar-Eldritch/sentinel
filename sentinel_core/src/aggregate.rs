@@ -325,7 +325,7 @@ pub struct PolicyAggregate<ES, SS, SNS> {
 
 impl<ES, SS, SNS> PolicyAggregate<ES, SS, SNS> {
     /// Creates a new `PolicyAggregate` with the given event, state, and snapshot
-    /// stores and the [default snapshot config](default_snapshot_config).
+    /// stores. Snapshots are captured every 50 versions and the last 5 are retained.
     pub fn new(event_store: ES, state_store: SS, snapshot_store: SNS) -> Self {
         Self {
             event_store,

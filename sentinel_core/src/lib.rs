@@ -1,8 +1,67 @@
 //! # Sentinel Core
 //!
-//! Core graph model, traits, and policy evaluation for the sentinel
-//! authorization library. Implements an NGAC-inspired attribute-matching
-//! policy graph with a Policy Enforcement Point (PEP).
+//! Core graph model, traits, and policy enforcement for the sentinel
+//! authorization library.
+//!
+//! ## What sentinel is
+//!
+//! Sentinel is an embeddable Rust authorization engine with two primary
+//! differentiators:
+//!
+//! 1. **List queries are provably consistent with point checks.** [`evaluate`]
+//!    and [`scope`] are two projections of the same attribute-matching logic.
+//!    `scope` returns exact `key IN (values…)` filter constraints — no
+//!    residuals, no approximation, no escape hatch. A resource admitted by
+//!    `scope` is guaranteed to be allowed by `evaluate`, and vice versa. This
+//!    is a tested invariant, not a best-effort approximation.
+//!
+//! 2. **Every policy decision is auditable retroactively.** Because the policy
+//!    graph is an event stream (via [epoch]), sentinel can reconstruct the exact
+//!    policy state at any past instant and run `evaluate`/`scope` against it.
+//!    See [`time_travel`].
+//!
+//! ## NGAC lineage and intentional deviation
+//!
+//! Sentinel implements the core NGAC (Next Generation Access Control) graph
+//! model — User (U), User Attribute (UA), Object Attribute (OA), Policy Class
+//! (PC) nodes with assignment and association edges — but deviates from the
+//! NIST standard in one deliberate way: **resources are never stored in the
+//! graph**.
+//!
+//! Instead, OA nodes carry attribute predicates (key + value set) that match
+//! resources at query time. This is *intensional* NGAC: the graph encodes
+//! *which resources belong to a scope* rather than enumerating them. The
+//! graph stays O(policies) regardless of data volume, whereas the NIST
+//! reference implementation is O(resources).
+//!
+//! ## Soundness invariant
+//!
+//! For any policy graph, subject attributes, operation, and resource type:
+//!
+//! > `scope_admits(scope(graph, req), resource)` **iff**
+//! > `evaluate(graph, req) == Allow`
+//!
+//! This biconditional is the project's north star. Every future matcher or
+//! constraint extension must preserve it or be rejected. It is verified by
+//! property-based tests sweeping arbitrary graph configurations, matcher
+//! combinations, and attribute maps.
+//!
+//! ## Quick example
+//!
+//! ```ignore
+//! // Point check
+//! let decision = evaluate(&graph, &AccessRequest::new("read", "job")
+//!     .subject_attrs(user_attrs)
+//!     .resource_attrs(job_attrs));
+//!
+//! // List-query filter injection — never a residual program to interpret
+//! let filter = scope(&graph, &ScopeRequest::new("read", "job")
+//!     .subject_attrs(user_attrs));
+//! // AccessScope::Constrained([Attribute { key: "org_id", values: [...] }])
+//! // or AccessScope::Unrestricted — always exact, never approximate
+//! ```
+//!
+//! [epoch]: https://github.com/Istar-Eldritch/epoch
 
 #![deny(missing_docs)]
 
