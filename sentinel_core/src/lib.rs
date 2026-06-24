@@ -98,9 +98,59 @@ pub enum AttributeMatcher {
         /// map's value for `key` is contained in this list.
         values: Vec<String>,
     },
+    /// Matches when the resource's `resource_key` attribute and the subject's
+    /// `subject_key` attribute share at least one value (ownership / co-membership
+    /// semantics). Subject values are bound at request time.
+    ///
+    /// In [`evaluate`], both maps are provided separately via
+    /// [`AttributeMatcher::matches_resource`]. In [`scope`], this resolves to a
+    /// concrete `Matching`-equivalent constraint using the subject's current
+    /// values for `subject_key`. When the subject has no values for
+    /// `subject_key`, the matcher contributes nothing (fail-closed).
+    Relative {
+        /// The attribute key looked up on the resource side.
+        resource_key: String,
+        /// The attribute key on the subject whose values must intersect with
+        /// the resource's `resource_key` values.
+        subject_key: String,
+    },
 }
 
 impl AttributeMatcher {
+    /// Tests `resource_attrs` against this matcher, given the requesting
+    /// subject's attributes.
+    ///
+    /// - [`AttributeMatcher::All`] always returns `true`.
+    /// - [`AttributeMatcher::Matching`] returns `true` when `resource_attrs`
+    ///   contains `key` and its value-set has a **non-empty intersection** with
+    ///   the matcher's `values` (D18 semantics). `subject_attrs` is ignored.
+    /// - [`AttributeMatcher::Relative`] returns `true` when
+    ///   `resource_attrs[resource_key]` and `subject_attrs[subject_key]` share
+    ///   at least one value. Returns `false` if either key is absent or either
+    ///   value set is empty (fail-closed).
+    pub fn matches_resource(
+        &self,
+        resource_attrs: &HashMap<String, HashSet<String>>,
+        subject_attrs: &HashMap<String, HashSet<String>>,
+    ) -> bool {
+        match self {
+            AttributeMatcher::All => true,
+            AttributeMatcher::Matching { key, values } => resource_attrs
+                .get(key)
+                .is_some_and(|vs| vs.iter().any(|v| values.contains(v))),
+            AttributeMatcher::Relative {
+                resource_key,
+                subject_key,
+            } => match (
+                resource_attrs.get(resource_key),
+                subject_attrs.get(subject_key),
+            ) {
+                (Some(rv), Some(sv)) => rv.iter().any(|v| sv.contains(v)),
+                _ => false,
+            },
+        }
+    }
+
     /// Tests whether the given attribute map satisfies this matcher.
     ///
     /// - [`AttributeMatcher::All`] always returns `true`.
@@ -109,13 +159,11 @@ impl AttributeMatcher {
     ///   with the matcher's `values` (D18 semantics).
     /// - A key mapped to an **empty set** behaves exactly like an absent key
     ///   (fail-closed: `any` over an empty set is `false`).
+    /// - [`AttributeMatcher::Relative`]: both keys are resolved against the
+    ///   same map (self-referential), preserving the existing single-map
+    ///   semantics used by UA matching in [`PolicyView::matching_uas`].
     pub fn matches(&self, attrs: &HashMap<String, HashSet<String>>) -> bool {
-        match self {
-            AttributeMatcher::All => true,
-            AttributeMatcher::Matching { key, values } => attrs
-                .get(key)
-                .is_some_and(|vs| vs.iter().any(|v| values.contains(v))),
-        }
+        self.matches_resource(attrs, attrs)
     }
 }
 
@@ -516,7 +564,9 @@ pub fn evaluate(view: &impl PolicyView, request: &AccessRequest) -> Decision {
                 AssociationTarget::ObjectAttribute(oa_id) => {
                     if let Some(oa) = view.get_oa(*oa_id)
                         && oa.resource_type == request.resource_type
-                        && oa.matcher.matches(&request.resource_attrs)
+                        && oa
+                            .matcher
+                            .matches_resource(&request.resource_attrs, &request.subject_attrs)
                     {
                         return Decision::Allow;
                     }
@@ -524,10 +574,10 @@ pub fn evaluate(view: &impl PolicyView, request: &AccessRequest) -> Decision {
                 }
                 AssociationTarget::PolicyClass(pc_id) => {
                     let oas = view.oas_for_pc(*pc_id, &request.resource_type);
-                    if oas
-                        .iter()
-                        .any(|oa| oa.matcher.matches(&request.resource_attrs))
-                    {
+                    if oas.iter().any(|oa| {
+                        oa.matcher
+                            .matches_resource(&request.resource_attrs, &request.subject_attrs)
+                    }) {
                         return Decision::Allow;
                     }
                 }
@@ -815,6 +865,75 @@ mod tests {
         };
         let attrs = HashMap::from([("org_id".to_string(), HashSet::from(["alpha".to_string()]))]);
         assert!(!matcher.matches(&attrs));
+    }
+
+    // --- AttributeMatcher::Relative / matches_resource tests ---
+
+    #[test]
+    fn relative_matches_resource_hit() {
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let resource = attrs(&[("owner", &["user-1"])]);
+        let subject = attrs(&[("id", &["user-1"])]);
+        assert!(matcher.matches_resource(&resource, &subject));
+    }
+
+    #[test]
+    fn relative_matches_resource_no_intersection() {
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let resource = attrs(&[("owner", &["user-2"])]);
+        let subject = attrs(&[("id", &["user-1"])]);
+        assert!(!matcher.matches_resource(&resource, &subject));
+    }
+
+    #[test]
+    fn relative_matches_resource_missing_resource_key() {
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let resource = attrs(&[("other", &["user-1"])]);
+        let subject = attrs(&[("id", &["user-1"])]);
+        assert!(!matcher.matches_resource(&resource, &subject));
+    }
+
+    #[test]
+    fn relative_matches_resource_missing_subject_key() {
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let resource = attrs(&[("owner", &["user-1"])]);
+        let subject = attrs(&[("other", &["user-1"])]);
+        assert!(!matcher.matches_resource(&resource, &subject));
+    }
+
+    #[test]
+    fn relative_matches_resource_empty_subject_set() {
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let resource = attrs(&[("owner", &["user-1"])]);
+        let subject = attrs(&[("id", &[])]);
+        assert!(!matcher.matches_resource(&resource, &subject));
+    }
+
+    #[test]
+    fn relative_matches_resource_multivalued_hit() {
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        // resource owner ∈ {user-1, user-2}, subject id ∈ {user-2, user-3} → overlap on user-2
+        let resource = attrs(&[("owner", &["user-1", "user-2"])]);
+        let subject = attrs(&[("id", &["user-2", "user-3"])]);
+        assert!(matcher.matches_resource(&resource, &subject));
     }
 
     // --- D18 multi-valued intersection semantics tests ---
@@ -3084,6 +3203,98 @@ mod tests {
         let req = AccessRequest::new("read", "job");
         // Must not panic; dangling reference → Deny
         assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    // ---- evaluate() with Relative OA matcher ----
+
+    fn relative_oa_graph() -> (PolicyGraph, Uuid) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa_id = Uuid::new_v4();
+        let oa = ObjectAttribute {
+            id: oa_id,
+            name: "owned_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "owner".to_string(),
+                subject_key: "id".to_string(),
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        (graph, oa_id)
+    }
+
+    #[test]
+    fn evaluate_allows_with_relative_oa_when_owner_matches_subject() {
+        let (graph, _) = relative_oa_graph();
+        let req = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("id", &["user-1"])]))
+            .resource_attrs(attrs(&[("owner", &["user-1"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Allow);
+    }
+
+    #[test]
+    fn evaluate_denies_with_relative_oa_when_owner_differs() {
+        let (graph, _) = relative_oa_graph();
+        let req = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("id", &["user-1"])]))
+            .resource_attrs(attrs(&[("owner", &["user-2"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    #[test]
+    fn evaluate_denies_with_relative_oa_when_subject_key_absent() {
+        let (graph, _) = relative_oa_graph();
+        let req = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("other", &["user-1"])]))
+            .resource_attrs(attrs(&[("owner", &["user-1"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    #[test]
+    fn evaluate_allows_relative_oa_via_pc() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let pc = PolicyClass {
+            id: Uuid::new_v4(),
+            name: "docs_pc".to_string(),
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "owned_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "owner".to_string(),
+                subject_key: "id".to_string(),
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_pc(pc.clone());
+        graph.add_oa(oa.clone());
+        graph.assign_oa_to_pc(oa.id, pc.id);
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::PolicyClass(pc.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("id", &["user-1"])]))
+            .resource_attrs(attrs(&[("owner", &["user-1"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Allow);
     }
 
     // ---- Decision type tests (REQ-EVAL-001) ----
