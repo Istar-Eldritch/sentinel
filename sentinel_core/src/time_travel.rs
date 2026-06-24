@@ -15,16 +15,18 @@
 //! fail-closed guarantee: an out-of-order (clock-skewed) event at version `k`
 //! with a future timestamp terminates the prefix at `k-1`, so all queries
 //! whose target time falls between the real event time and the skewed timestamp
-//! will see the policy as of version `k-1` — hiding legitimately committed
-//! later policy. This is the safe direction for authorization audits, but
-//! operators should be aware that skewed clocks can make historical views
-//! shorter than reality.
+//! will see the policy as of version `k-1`. Critically, *every* subsequent
+//! event (k+1, k+2, …) is also hidden for that window, even if those later
+//! events have correct timestamps — one bad clock stamps truncates all following
+//! history. This is the safe (fail-closed) direction for authorization audits,
+//! but auditors should be aware: under clock skew, historical views may conclude
+//! policy was more restrictive than it actually was.
 //!
 //! [`policy_version_at`]: PolicyAggregate::policy_version_at
 //! [`policy_at`]: PolicyAggregate::policy_at
 //! [`policy_at_version`]: PolicyAggregate::policy_at_version
 
-use chrono::{DateTime, Utc};
+pub use chrono::{DateTime, Utc};
 
 use epoch_core::prelude::*;
 use tokio_stream::StreamExt;
@@ -55,7 +57,6 @@ where
     SS: StateStoreBackend<PolicyState> + Send + Sync + Clone,
     SNS: SnapshotStore<PolicyState> + Send + Sync + Clone,
     ES::Error: 'static,
-    SNS::Error: 'static,
 {
     /// Returns the highest `stream_version` `V` such that *every* event in the
     /// prefix `[1, V]` has `created_at <= t`, or `None` when the first event
