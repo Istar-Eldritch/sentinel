@@ -28,6 +28,8 @@
 
 pub use chrono::{DateTime, Utc};
 
+use std::collections::{HashMap, HashSet};
+
 use epoch_core::prelude::*;
 use tokio_stream::StreamExt;
 
@@ -49,6 +51,17 @@ pub enum TimeTravelError {
     /// Reconstruction (snapshot load + bounded replay) failed.
     #[error("reconstruction error: {0}")]
     Reconstruction(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// A single reachable access grant returned by [`PolicyAggregate::reachable_at`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReachableEntry {
+    /// The operation that is reachable.
+    pub operation: String,
+    /// The resource type for which the operation is reachable.
+    pub resource_type: String,
+    /// The scope of the reachable access grant.
+    pub scope: AccessScope,
 }
 
 impl<ES, SS, SNS> PolicyAggregate<ES, SS, SNS>
@@ -183,6 +196,39 @@ where
             Some(graph) => scope(&graph, request),
             None => AccessScope::None,
         })
+    }
+
+    /// Enumerates all `(operation, resource_type)` pairs from `vocabulary` for
+    /// which the given `subject_attrs` hold at least one grant as of time `t`.
+    ///
+    /// Reconstructs the policy graph **once** via [`policy_at`](Self::policy_at)
+    /// and runs [`scope`] for each vocabulary entry. Entries whose scope
+    /// resolves to [`AccessScope::None`] are omitted. Returns an empty vec when
+    /// `t` predates the first policy event (fail-closed).
+    pub async fn reachable_at(
+        &self,
+        t: DateTime<Utc>,
+        subject_attrs: HashMap<String, HashSet<String>>,
+        vocabulary: &[(String, String)],
+    ) -> Result<Vec<ReachableEntry>, TimeTravelError> {
+        let graph = match self.policy_at(t).await? {
+            Some(g) => g,
+            None => return Ok(vec![]),
+        };
+        let mut entries = Vec::new();
+        for (operation, resource_type) in vocabulary {
+            let sreq =
+                ScopeRequest::new(operation, resource_type).subject_attrs(subject_attrs.clone());
+            let s = scope(&graph, &sreq);
+            if s != AccessScope::None {
+                entries.push(ReachableEntry {
+                    operation: operation.clone(),
+                    resource_type: resource_type.clone(),
+                    scope: s,
+                });
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -738,5 +784,231 @@ mod tests {
     async fn policy_at_version_on_empty_stream_returns_none() {
         let agg = make_aggregate();
         assert!(agg.policy_at_version(1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reachable_at_empty_vocabulary_returns_empty() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        agg.get_event_store()
+            .store_events(vec![ua_event("first", 1, t1)])
+            .await
+            .unwrap();
+
+        let result = agg
+            .reachable_at(t1, attrs(&[("role", &["admin"])]), &[])
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reachable_at_pre_history_returns_empty() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        agg.get_event_store()
+            .store_events(vec![ua_event("first", 1, t1)])
+            .await
+            .unwrap();
+
+        let before = t1 - Duration::seconds(1);
+        let vocab = vec![("read".to_string(), "job".to_string())];
+        let result = agg
+            .reachable_at(before, attrs(&[("role", &["admin"])]), &vocab)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reachable_at_no_matching_subject_returns_empty() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        agg.get_event_store()
+            .store_events(vec![
+                event_at(
+                    PolicyEvent::UserAttributeCreated {
+                        id: ua_id,
+                        name: "admins".to_string(),
+                        matcher: AttributeMatcher::Matching {
+                            key: "role".to_string(),
+                            values: vec!["admin".to_string()],
+                        },
+                    },
+                    1,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::PolicyClassCreated {
+                        id: pc_id,
+                        name: "pc".to_string(),
+                    },
+                    2,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::ObjectAttributeCreated {
+                        id: oa_id,
+                        name: "all_jobs".to_string(),
+                        resource_type: "job".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    3,
+                    t1,
+                ),
+                event_at(PolicyEvent::OaAssignedToPc { oa_id, pc_id }, 4, t1),
+                event_at(
+                    PolicyEvent::AssociationCreated {
+                        ua_id,
+                        target: AssociationTarget::PolicyClass(pc_id),
+                        operations: HashSet::from(["read".to_string()]),
+                    },
+                    5,
+                    t1,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let vocab = vec![("read".to_string(), "job".to_string())];
+        let result = agg
+            .reachable_at(
+                t1 + Duration::seconds(1),
+                attrs(&[("role", &["guest"])]),
+                &vocab,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reachable_at_partial_grants_returns_only_matching() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        agg.get_event_store()
+            .store_events(vec![
+                event_at(
+                    PolicyEvent::UserAttributeCreated {
+                        id: ua_id,
+                        name: "readers".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    1,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::PolicyClassCreated {
+                        id: pc_id,
+                        name: "pc".to_string(),
+                    },
+                    2,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::ObjectAttributeCreated {
+                        id: oa_id,
+                        name: "all_jobs".to_string(),
+                        resource_type: "job".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    3,
+                    t1,
+                ),
+                event_at(PolicyEvent::OaAssignedToPc { oa_id, pc_id }, 4, t1),
+                event_at(
+                    PolicyEvent::AssociationCreated {
+                        ua_id,
+                        target: AssociationTarget::PolicyClass(pc_id),
+                        operations: HashSet::from(["read".to_string()]),
+                    },
+                    5,
+                    t1,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let vocab = vec![
+            ("read".to_string(), "job".to_string()),
+            ("write".to_string(), "job".to_string()),
+        ];
+        let result = agg
+            .reachable_at(t1 + Duration::seconds(1), attrs(&[]), &vocab)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].operation, "read");
+        assert_eq!(result[0].resource_type, "job");
+    }
+
+    #[tokio::test]
+    async fn reachable_at_unrestricted_scope_included() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        agg.get_event_store()
+            .store_events(vec![
+                event_at(
+                    PolicyEvent::UserAttributeCreated {
+                        id: ua_id,
+                        name: "all_users".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    1,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::PolicyClassCreated {
+                        id: pc_id,
+                        name: "global_pc".to_string(),
+                    },
+                    2,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::ObjectAttributeCreated {
+                        id: oa_id,
+                        name: "all_jobs".to_string(),
+                        resource_type: "job".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    3,
+                    t1,
+                ),
+                event_at(PolicyEvent::OaAssignedToPc { oa_id, pc_id }, 4, t1),
+                event_at(
+                    PolicyEvent::AssociationCreated {
+                        ua_id,
+                        target: AssociationTarget::PolicyClass(pc_id),
+                        operations: HashSet::from(["read".to_string()]),
+                    },
+                    5,
+                    t1,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let vocab = vec![("read".to_string(), "job".to_string())];
+        let result = agg
+            .reachable_at(t1 + Duration::seconds(1), attrs(&[]), &vocab)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].scope, AccessScope::Unrestricted);
     }
 }
