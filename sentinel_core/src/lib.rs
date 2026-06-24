@@ -4571,7 +4571,7 @@ mod proptest_invariant_tests {
         )
     }
 
-    /// Arbitrary matcher: `All` or `Matching` with 1–3 values.
+    /// Arbitrary matcher: `All`, `Matching` with 1–3 values, or `Relative`.
     fn arb_matcher() -> impl Strategy<Value = AttributeMatcher> {
         prop_oneof![
             Just(AttributeMatcher::All),
@@ -4580,6 +4580,12 @@ mod proptest_invariant_tests {
                 prop::collection::vec(arb_attr_value(), 1..=3)
             )
                 .prop_map(|(key, values)| AttributeMatcher::Matching { key, values }),
+            (arb_attr_key(), arb_attr_key()).prop_map(|(resource_key, subject_key)| {
+                AttributeMatcher::Relative {
+                    resource_key,
+                    subject_key,
+                }
+            }),
         ]
     }
 

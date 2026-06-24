@@ -2932,4 +2932,103 @@ mod tests {
 
         assert!(!state.graph.policy_classes.contains_key(&pc_id));
     }
+
+    // =========================================================
+    // Relative matcher round-trip tests
+    // =========================================================
+
+    #[tokio::test]
+    async fn create_ua_with_relative_matcher_round_trips_through_command_event_apply() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let event = make_event(PolicyEvent::UserAttributeCreated {
+            id,
+            name: "owners".to_string(),
+            matcher: matcher.clone(),
+        });
+        let state = agg.apply(None, &event).unwrap().unwrap();
+        let ua = state.graph.user_attributes.get(&id).unwrap();
+        assert_eq!(ua.id, id);
+        assert_eq!(ua.name, "owners");
+        assert_eq!(ua.matcher, matcher);
+    }
+
+    #[tokio::test]
+    async fn create_oa_with_relative_matcher_round_trips_through_command_event_apply() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let event = make_event(PolicyEvent::ObjectAttributeCreated {
+            id,
+            name: "owned_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: matcher.clone(),
+        });
+        let state = agg.apply(None, &event).unwrap().unwrap();
+        let oa = state.graph.get_oa(id).unwrap();
+        assert_eq!(oa.id, id);
+        assert_eq!(oa.name, "owned_docs");
+        assert_eq!(oa.resource_type, "doc");
+        assert_eq!(oa.matcher, matcher);
+    }
+
+    #[tokio::test]
+    async fn create_ua_relative_matcher_via_aggregate_handle_persists_in_graph() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "user_id".to_string(),
+        };
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateUserAttribute {
+                    id,
+                    name: "owners".to_string(),
+                    matcher: matcher.clone(),
+                },
+                Some(PolicyActor { id: Uuid::new_v4() }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let ua = state.graph.user_attributes.get(&id).unwrap();
+        assert_eq!(ua.matcher, matcher);
+    }
+
+    #[tokio::test]
+    async fn create_oa_relative_matcher_via_aggregate_handle_persists_in_graph() {
+        let agg = make_aggregate();
+        let id = Uuid::new_v4();
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "user_id".to_string(),
+        };
+        let state = agg
+            .handle(Command::new(
+                POLICY_AGGREGATE_ID,
+                PolicyCommand::CreateObjectAttribute {
+                    id,
+                    name: "owned_docs".to_string(),
+                    resource_type: "doc".to_string(),
+                    matcher: matcher.clone(),
+                },
+                Some(PolicyActor { id: Uuid::new_v4() }),
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let oa = state.graph.get_oa(id).unwrap();
+        assert_eq!(oa.matcher, matcher);
+    }
 }
