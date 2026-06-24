@@ -438,6 +438,14 @@ impl AccessRequest {
 ///      `request.resource_attrs` → return `Allow`. Mere existence of OAs
 ///      under the PC is not sufficient (D16 Option B, REQ-EVAL-004).
 /// 3. Return `Deny`.
+///
+/// # Soundness
+///
+/// `evaluate` and [`scope`] are two projections of the same attribute-matching
+/// logic. For any policy graph, subject, operation, and resource type:
+/// a resource admitted by `scope` constraints is allowed by `evaluate`, and
+/// a resource denied by `evaluate` is not admitted by `scope`. This invariant
+/// is verified by property-based tests.
 pub fn evaluate(view: &impl PolicyView, request: &AccessRequest) -> Decision {
     let uas = view.matching_uas(&request.subject_attrs);
     for ua in uas {
@@ -581,6 +589,14 @@ pub enum AccessScope {
 ///    preserving first-seen value order) → `ScopeConstraint::Attribute`.
 /// 5. Return `Constrained(constraints)` if any constraints were collected,
 ///    otherwise `None`.
+///
+/// # Soundness
+///
+/// `scope` and [`evaluate`] are two projections of the same attribute-matching
+/// logic. The constraints returned by `scope` are exact — no approximation,
+/// no residuals. A resource satisfying the constraints is guaranteed to be
+/// allowed by `evaluate` for the same subject and operation. This invariant
+/// is verified by property-based tests.
 pub fn scope(view: &impl PolicyView, request: &ScopeRequest) -> AccessScope {
     let uas = view.matching_uas(&request.subject_attrs);
 
@@ -3983,6 +3999,162 @@ mod invariant_tests {
             attrs(&[]),
         ];
         check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-INV-001 — property-based soundness invariant tests
+// ---------------------------------------------------------------------------
+
+/// Property-based verification of the soundness invariant: for arbitrary
+/// policy graphs, subjects, and resources, `scope_admits(scope(...), r)` iff
+/// `evaluate(..., r) == Allow`.
+#[cfg(test)]
+mod proptest_invariant_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    /// Returns `true` when `resource_attrs` is admitted by `s` (mirrors
+    /// [`AttributeMatcher::matches`] / `invariant_tests::scope_admits`).
+    fn scope_admits(s: &AccessScope, resource_attrs: &HashMap<String, HashSet<String>>) -> bool {
+        match s {
+            AccessScope::Unrestricted => true,
+            AccessScope::None => false,
+            AccessScope::Constrained(constraints) => constraints.iter().any(|c| {
+                let ScopeConstraint::Attribute { key, values } = c;
+                resource_attrs
+                    .get(key)
+                    .is_some_and(|vs| vs.iter().any(|v| values.contains(v)))
+            }),
+        }
+    }
+
+    /// Arbitrary short attribute key from a small alphabet.
+    fn arb_attr_key() -> impl Strategy<Value = String> {
+        "[a-z]{1,4}".prop_map(|s| s)
+    }
+
+    /// Arbitrary short attribute value from a small alphabet.
+    fn arb_attr_value() -> impl Strategy<Value = String> {
+        "[a-z]{1,4}".prop_map(|s| s)
+    }
+
+    /// Arbitrary multi-valued attribute map (0–3 keys, 0–3 values each).
+    fn arb_attr_map() -> impl Strategy<Value = HashMap<String, HashSet<String>>> {
+        prop::collection::hash_map(
+            arb_attr_key(),
+            prop::collection::hash_set(arb_attr_value(), 0..=3),
+            0..=3,
+        )
+    }
+
+    /// Arbitrary matcher: `All` or `Matching` with 1–3 values.
+    fn arb_matcher() -> impl Strategy<Value = AttributeMatcher> {
+        prop_oneof![
+            Just(AttributeMatcher::All),
+            (
+                arb_attr_key(),
+                prop::collection::vec(arb_attr_value(), 1..=3)
+            )
+                .prop_map(|(key, values)| AttributeMatcher::Matching { key, values }),
+        ]
+    }
+
+    /// Generates a coherent policy graph: 0–3 UAs, 0–3 OAs (all
+    /// `resource_type: "res"`), an optional PC, and associations/assignments
+    /// that only ever reference real node IDs.
+    fn arb_graph() -> impl Strategy<Value = PolicyGraph> {
+        (
+            prop::collection::vec(arb_matcher(), 0..=3),
+            prop::collection::vec(arb_matcher(), 0..=3),
+            any::<bool>(),
+            prop::collection::vec(any::<bool>(), 9),
+            prop::collection::vec(any::<bool>(), 3),
+            prop::collection::vec(any::<bool>(), 3),
+        )
+            .prop_map(|(ua_matchers, oa_matchers, has_pc, ua_oa, oa_pc, ua_pc)| {
+                let mut graph = PolicyGraph::new();
+                let ua_ids: Vec<Uuid> = ua_matchers.iter().map(|_| Uuid::new_v4()).collect();
+                let oa_ids: Vec<Uuid> = oa_matchers.iter().map(|_| Uuid::new_v4()).collect();
+
+                for (i, m) in ua_matchers.into_iter().enumerate() {
+                    graph.add_ua(UserAttribute {
+                        id: ua_ids[i],
+                        name: format!("ua{i}"),
+                        matcher: m,
+                    });
+                }
+                for (j, m) in oa_matchers.into_iter().enumerate() {
+                    graph.add_oa(ObjectAttribute {
+                        id: oa_ids[j],
+                        name: format!("oa{j}"),
+                        resource_type: "res".to_string(),
+                        matcher: m,
+                    });
+                }
+
+                let pc_id = Uuid::new_v4();
+                if has_pc {
+                    graph.add_pc(PolicyClass {
+                        id: pc_id,
+                        name: "pc".to_string(),
+                    });
+                    for (j, &oid) in oa_ids.iter().enumerate() {
+                        if oa_pc[j] {
+                            graph.assign_oa_to_pc(oid, pc_id);
+                        }
+                    }
+                }
+
+                for (i, &uid) in ua_ids.iter().enumerate() {
+                    for (j, &oid) in oa_ids.iter().enumerate() {
+                        if ua_oa[i * 3 + j] {
+                            graph.add_association(Association {
+                                ua_id: uid,
+                                target: AssociationTarget::ObjectAttribute(oid),
+                                operations: HashSet::from(["op".to_string()]),
+                            });
+                        }
+                    }
+                    if has_pc && ua_pc[i] {
+                        graph.add_association(Association {
+                            ua_id: uid,
+                            target: AssociationTarget::PolicyClass(pc_id),
+                            operations: HashSet::from(["op".to_string()]),
+                        });
+                    }
+                }
+
+                graph
+            })
+    }
+
+    proptest! {
+        /// For any generated graph, subject, and resource, `scope` admits the
+        /// resource exactly when `evaluate` allows it.
+        #[test]
+        fn soundness_invariant_holds(
+            graph in arb_graph(),
+            subject in arb_attr_map(),
+            resource in arb_attr_map(),
+        ) {
+            let operation = "op";
+            let resource_type = "res";
+
+            let sreq = ScopeRequest::new(operation, resource_type)
+                .subject_attrs(subject.clone());
+            let s = scope(&graph, &sreq);
+            let admitted = scope_admits(&s, &resource);
+
+            let areq = AccessRequest::new(operation, resource_type)
+                .subject_attrs(subject)
+                .resource_attrs(resource.clone());
+            let allowed = evaluate(&graph, &areq) == Decision::Allow;
+
+            prop_assert_eq!(admitted, allowed, "soundness violated");
+        }
     }
 }
 
