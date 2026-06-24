@@ -36,6 +36,23 @@ Sentinel implements the core [NGAC](https://csrc.nist.gov/publications/detail/sp
 
 Instead, OA nodes carry attribute predicates (key + value set) that match resources at query time. This is *intensional* NGAC: the graph encodes *which resources belong to a scope* rather than enumerating them. The graph stays O(policies) regardless of data volume. NIST's reference implementation is O(resources); sentinel's design is O(policies).
 
+### Sentinel vs. theoretical NGAC
+
+| Capability | NGAC standard | Sentinel |
+|---|---|---|
+| Graph cardinality | O(resources) — objects are nodes | **O(policies)** — resources matched by predicate, never stored |
+| List-query filter consistency | Not addressed | **Tested invariant** — `scope` output is provably consistent with `evaluate` |
+| Policy audit / time-travel | Not addressed | **First-class** — event-sourced graph, full retroactive reconstruction |
+
+### Sentinel vs. incumbents (on sentinel's differentiators)
+
+This table covers only the dimensions where sentinel makes a specific claim. For everything else (policy expressiveness, multi-language support, tooling), established engines (Cedar, Cerbos, OPA, SpiceDB) are ahead.
+
+| Capability | Cedar | Cerbos | OPA | SpiceDB | Sentinel |
+|---|---|---|---|---|---|
+| List-query filter | Partial eval (experimental, residual AST) | `PlanResources` (residual CEL, may return `CONDITIONAL`) | Partial eval (residual Rego) | Not applicable (tuple-based) | **Exact constraints, no residuals — proven consistent with point check** |
+| Retroactive access audit | Decision logs only | Decision logs only | Decision logs only | Watch API (current state) | **Full policy reconstruction at any past timestamp** |
+
 ## Key Concepts
 
 - **Attribute-matching model**: Resources are not nodes in the graph. OA nodes carry metadata about which resource attributes they match, keeping the graph small regardless of data volume.
