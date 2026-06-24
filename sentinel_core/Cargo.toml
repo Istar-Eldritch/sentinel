@@ -15,7 +15,7 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 uuid = { version = "1.17.0", features = ["serde", "v4", "macro-diagnostics"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4" }
 epoch_core = { git = "https://github.com/Istar-Eldritch/epoch.git", version = "0.1.0", rev = "ac322f0" }
 epoch_derive = { git = "https://github.com/Istar-Eldritch/epoch.git", version = "0.1.0", rev = "ac322f0" }
 

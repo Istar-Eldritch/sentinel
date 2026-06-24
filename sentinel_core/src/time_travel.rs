@@ -17,7 +17,7 @@
 //! whose target time falls between the real event time and the skewed timestamp
 //! will see the policy as of version `k-1`. Critically, *every* subsequent
 //! event (k+1, k+2, …) is also hidden for that window, even if those later
-//! events have correct timestamps — one bad clock stamps truncates all following
+//! events have correct timestamps — one bad clock stamp truncates all following
 //! history. This is the safe (fail-closed) direction for authorization audits,
 //! but auditors should be aware: under clock skew, historical views may conclude
 //! policy was more restrictive than it actually was.
@@ -732,5 +732,11 @@ mod tests {
         let agg = make_aggregate();
         assert_eq!(agg.policy_version_at(Utc::now()).await.unwrap(), None);
         assert!(agg.policy_at(Utc::now()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn policy_at_version_on_empty_stream_returns_none() {
+        let agg = make_aggregate();
+        assert!(agg.policy_at_version(1).await.unwrap().is_none());
     }
 }
