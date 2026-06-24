@@ -54,7 +54,7 @@ pub enum TimeTravelError {
 }
 
 /// A single reachable access grant returned by [`PolicyAggregate::reachable_at`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachableEntry {
     /// The operation that is reachable.
     pub operation: String,
@@ -949,6 +949,145 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].operation, "read");
         assert_eq!(result[0].resource_type, "job");
+    }
+
+    #[tokio::test]
+    async fn reachable_at_flips_across_grant() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let grant_t = t1 + Duration::seconds(100);
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+
+        agg.get_event_store()
+            .store_events(vec![
+                event_at(
+                    PolicyEvent::UserAttributeCreated {
+                        id: ua_id,
+                        name: "readers".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    1,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::ObjectAttributeCreated {
+                        id: oa_id,
+                        name: "all_jobs".to_string(),
+                        resource_type: "job".to_string(),
+                        matcher: AttributeMatcher::All,
+                    },
+                    2,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::AssociationCreated {
+                        ua_id,
+                        target: AssociationTarget::ObjectAttribute(oa_id),
+                        operations: HashSet::from(["read".to_string()]),
+                    },
+                    3,
+                    grant_t,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let vocab = vec![("read".to_string(), "job".to_string())];
+
+        let before = agg
+            .reachable_at(grant_t - Duration::seconds(1), attrs(&[]), &vocab)
+            .await
+            .unwrap();
+        assert!(before.is_empty(), "no access before grant");
+
+        let after = agg
+            .reachable_at(grant_t + Duration::seconds(1), attrs(&[]), &vocab)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].operation, "read");
+        assert_eq!(after[0].resource_type, "job");
+    }
+
+    #[tokio::test]
+    async fn reachable_at_constrained_scope_carried_through() {
+        let agg = make_aggregate();
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let ua_id = Uuid::new_v4();
+        let oa_id = Uuid::new_v4();
+        let pc_id = Uuid::new_v4();
+
+        agg.get_event_store()
+            .store_events(vec![
+                event_at(
+                    PolicyEvent::UserAttributeCreated {
+                        id: ua_id,
+                        name: "alpha_admins".to_string(),
+                        matcher: AttributeMatcher::Matching {
+                            key: "role".to_string(),
+                            values: vec!["admin".to_string()],
+                        },
+                    },
+                    1,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::PolicyClassCreated {
+                        id: pc_id,
+                        name: "pc".to_string(),
+                    },
+                    2,
+                    t1,
+                ),
+                event_at(
+                    PolicyEvent::ObjectAttributeCreated {
+                        id: oa_id,
+                        name: "alpha_jobs".to_string(),
+                        resource_type: "job".to_string(),
+                        matcher: AttributeMatcher::Matching {
+                            key: "org_id".to_string(),
+                            values: vec!["alpha".to_string()],
+                        },
+                    },
+                    3,
+                    t1,
+                ),
+                event_at(PolicyEvent::OaAssignedToPc { oa_id, pc_id }, 4, t1),
+                event_at(
+                    PolicyEvent::AssociationCreated {
+                        ua_id,
+                        target: AssociationTarget::PolicyClass(pc_id),
+                        operations: HashSet::from(["read".to_string()]),
+                    },
+                    5,
+                    t1,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let vocab = vec![("read".to_string(), "job".to_string())];
+        let result = agg
+            .reachable_at(
+                t1 + Duration::seconds(1),
+                attrs(&[("role", &["admin"])]),
+                &vocab,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].operation, "read");
+        match &result[0].scope {
+            AccessScope::Constrained(constraints) => {
+                assert_eq!(constraints.len(), 1);
+                let ScopeConstraint::Attribute { key, values } = &constraints[0];
+                assert_eq!(key, "org_id");
+                assert!(values.contains(&"alpha".to_string()));
+            }
+            other => panic!("expected Constrained scope, got {:?}", other),
+        }
     }
 
     #[tokio::test]

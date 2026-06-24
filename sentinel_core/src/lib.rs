@@ -4157,23 +4157,19 @@ mod proptest_invariant_tests {
 
                     // Occasionally add dangling associations (non-existent target IDs)
                     // to exercise the fail-closed path in evaluate/scope.
-                    if add_dangling_oa {
-                        if let Some(&uid) = ua_ids.first() {
-                            graph.add_association(Association {
-                                ua_id: uid,
-                                target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
-                                operations: HashSet::from([operation.clone()]),
-                            });
-                        }
+                    if add_dangling_oa && let Some(&uid) = ua_ids.first() {
+                        graph.add_association(Association {
+                            ua_id: uid,
+                            target: AssociationTarget::ObjectAttribute(Uuid::new_v4()),
+                            operations: HashSet::from([operation.clone()]),
+                        });
                     }
-                    if add_dangling_pc {
-                        if let Some(&uid) = ua_ids.first() {
-                            graph.add_association(Association {
-                                ua_id: uid,
-                                target: AssociationTarget::PolicyClass(Uuid::new_v4()),
-                                operations: HashSet::from([operation.clone()]),
-                            });
-                        }
+                    if add_dangling_pc && let Some(&uid) = ua_ids.first() {
+                        graph.add_association(Association {
+                            ua_id: uid,
+                            target: AssociationTarget::PolicyClass(Uuid::new_v4()),
+                            operations: HashSet::from([operation.clone()]),
+                        });
                     }
 
                     (graph, operation, resource_type)
