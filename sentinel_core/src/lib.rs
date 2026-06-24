@@ -704,10 +704,11 @@ pub enum AccessScope {
 /// 4. For each `Matching { key, values }` or `Relative { resource_key, subject_key }`
 ///    matcher (in candidate-first-seen order), group by key and union the values
 ///    lists (deduplicating, preserving first-seen value order) →
-///    `ScopeConstraint::Attribute`. For `Relative`, the resolved subject values
-///    within a single constraint are sorted (deterministic within that
-///    constraint); cross-constraint ordering across an `AccessScope` follows
-///    first-seen key order over HashMap iteration, same as the `Matching` path.
+///    `ScopeConstraint::Attribute`. For `Relative`, values contributed by each
+///    `Relative` OA are sorted before being unioned into the constraint
+///    (deterministic per-OA contribution); the merged constraint result follows
+///    first-seen value order. Cross-constraint ordering across an `AccessScope`
+///    follows first-seen key order over HashMap iteration, same as the `Matching` path.
 ///    Absent or empty subject values contribute nothing (fail-closed).
 /// 5. Return `Constrained(constraints)` if any constraints were collected,
 ///    otherwise `None`.
@@ -3322,8 +3323,8 @@ mod tests {
 
     #[test]
     fn relative_same_key_overlapping_grants_non_overlapping_denies() {
-        // resource_key == subject_key: self-referential co-membership check.
-        // Both sides resolve to the same attribute on the subject map.
+        // resource_key == subject_key: verifies resource[key] ∩ subject[key] ≠ ∅
+        // using distinct resource and subject attribute maps.
         let mut graph = PolicyGraph::new();
         let ua = UserAttribute {
             id: Uuid::new_v4(),
@@ -3355,6 +3356,44 @@ mod tests {
         let req_deny = AccessRequest::new("read", "doc")
             .subject_attrs(attrs(&[("team", &["a", "b"])]))
             .resource_attrs(attrs(&[("team", &["c"])]));
+        assert_eq!(evaluate(&graph, &req_deny), Decision::Deny);
+    }
+
+    #[test]
+    fn relative_on_ua_is_self_referential() {
+        // When a Relative matcher is on a UA, matching_uas calls
+        // matches(subject_attrs), which is matches_resource(subject_attrs,
+        // subject_attrs). Both resource_key and subject_key resolve against
+        // the subject map: subject[resource_key] ∩ subject[subject_key] ≠ ∅.
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "cross_dept_role".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "dept".to_string(),
+                subject_key: "role".to_string(),
+            },
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Overlapping: subject["dept"] ∩ subject["role"] = {"eng"} ≠ ∅ → Allow
+        let req_allow = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("dept", &["eng"]), ("role", &["eng"])]));
+        assert_eq!(evaluate(&graph, &req_allow), Decision::Allow);
+        // Non-overlapping: subject["dept"] ∩ subject["role"] = ∅ → Deny
+        let req_deny = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("dept", &["eng"]), ("role", &["hr"])]));
         assert_eq!(evaluate(&graph, &req_deny), Decision::Deny);
     }
 
