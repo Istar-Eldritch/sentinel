@@ -693,9 +693,12 @@ pub enum AccessScope {
 ///      UA→PC is shorthand for "every OA under that PC", not god-mode.
 /// 3. If any candidate OA has `matcher == AttributeMatcher::All`, return
 ///    `Unrestricted` immediately (D17 short-circuit: `X OR true = true`).
-/// 4. For each `Matching { key, values }` matcher (in candidate-first-seen
-///    order), group by `key` and union the `values` lists (deduplicating,
-///    preserving first-seen value order) → `ScopeConstraint::Attribute`.
+/// 4. For each `Matching { key, values }` or `Relative { resource_key, subject_key }`
+///    matcher (in candidate-first-seen order), group by key and union the values
+///    lists (deduplicating, preserving first-seen value order) →
+///    `ScopeConstraint::Attribute`. For `Relative`, subject values are resolved at
+///    request time and sorted for deterministic output; absent or empty subject
+///    values contribute nothing (fail-closed).
 /// 5. Return `Constrained(constraints)` if any constraints were collected,
 ///    otherwise `None`.
 ///
@@ -740,20 +743,44 @@ pub fn scope(view: &impl PolicyView, request: &ScopeRequest) -> AccessScope {
         return AccessScope::Unrestricted;
     }
 
-    // Step 4: merge Matching matchers by key (first-seen key order, union values)
+    // Step 4: merge Matching/Relative matchers by key (first-seen key order, union values)
     let mut key_order: Vec<String> = Vec::new();
     let mut key_values: HashMap<String, Vec<String>> = HashMap::new();
 
     for oa in &candidate_oas {
-        if let AttributeMatcher::Matching { key, values } = &oa.matcher {
-            let entry = key_values.entry(key.clone()).or_insert_with(|| {
-                key_order.push(key.clone());
-                Vec::new()
-            });
-            for v in values {
-                if !entry.contains(v) {
-                    entry.push(v.clone());
+        match &oa.matcher {
+            AttributeMatcher::All => {} // handled by step-3 short-circuit
+            AttributeMatcher::Matching { key, values } => {
+                let entry = key_values.entry(key.clone()).or_insert_with(|| {
+                    key_order.push(key.clone());
+                    Vec::new()
+                });
+                for v in values {
+                    if !entry.contains(v) {
+                        entry.push(v.clone());
+                    }
                 }
+            }
+            AttributeMatcher::Relative {
+                resource_key,
+                subject_key,
+            } => {
+                if let Some(sv) = request.subject_attrs.get(subject_key)
+                    && !sv.is_empty()
+                {
+                    let mut vals: Vec<String> = sv.iter().cloned().collect();
+                    vals.sort();
+                    let entry = key_values.entry(resource_key.clone()).or_insert_with(|| {
+                        key_order.push(resource_key.clone());
+                        Vec::new()
+                    });
+                    for v in vals {
+                        if !entry.contains(&v) {
+                            entry.push(v);
+                        }
+                    }
+                }
+                // absent or empty subject values: contribute nothing (fail-closed)
             }
         }
     }
@@ -3872,6 +3899,141 @@ mod tests {
         assert_eq!(scope(&graph, &req), AccessScope::None);
     }
 
+    // ---- scope() with Relative OA matcher ----
+
+    /// Builds a minimal graph for scope() tests with a Relative OA:
+    /// - `ua`: All-matcher
+    /// - `oa`: `owned_docs`, resource_type="doc",
+    ///   `Relative { resource_key: "owner", subject_key: "id" }`
+    /// - Association: `(ua → oa, {"read"})`
+    fn scope_relative_graph() -> PolicyGraph {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "owned_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "owner".to_string(),
+                subject_key: "id".to_string(),
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph
+    }
+
+    /// A `Relative` OA with a subject carrying the `subject_key` value produces
+    /// `Constrained` equivalent to `Matching { key: resource_key, values: subject_values }`.
+    #[test]
+    fn scope_relative_oa_constrained_when_subject_has_values() {
+        let graph = scope_relative_graph();
+        let req = ScopeRequest::new("read", "doc").subject_attrs(attrs(&[("id", &["user-1"])]));
+        assert_eq!(
+            scope(&graph, &req),
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "owner".to_string(),
+                values: vec!["user-1".to_string()],
+            }])
+        );
+    }
+
+    /// Multiple subject values are sorted before becoming constraint values
+    /// (D-CLOUD187-3: deterministic output).
+    #[test]
+    fn scope_relative_oa_subject_values_are_sorted() {
+        let graph = scope_relative_graph();
+        let req = ScopeRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("id", &["user-3", "user-1", "user-2"])]));
+        if let AccessScope::Constrained(constraints) = scope(&graph, &req) {
+            let ScopeConstraint::Attribute { key, values } = &constraints[0];
+            assert_eq!(key, "owner");
+            assert_eq!(values, &["user-1", "user-2", "user-3"]);
+        } else {
+            panic!("Expected Constrained");
+        }
+    }
+
+    /// When the subject has no `subject_key`, the matcher contributes nothing
+    /// and `scope` returns `None` (fail-closed).
+    #[test]
+    fn scope_relative_oa_none_when_subject_key_absent() {
+        let graph = scope_relative_graph();
+        let req = ScopeRequest::new("read", "doc").subject_attrs(attrs(&[("other", &["user-1"])]));
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    /// When the subject maps `subject_key` to an empty set, the matcher
+    /// contributes nothing and `scope` returns `None` (fail-closed).
+    #[test]
+    fn scope_relative_oa_none_when_subject_values_empty() {
+        let graph = scope_relative_graph();
+        let req = ScopeRequest::new("read", "doc").subject_attrs(attrs(&[("id", &[])]));
+        assert_eq!(scope(&graph, &req), AccessScope::None);
+    }
+
+    /// A `Relative` OA and a `Matching` OA on the same resource key merge their
+    /// values (union/OR semantics, same as two `Matching` OAs).
+    #[test]
+    fn scope_relative_and_matching_oa_same_key_merge_values() {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa_relative = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "owned_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "owner".to_string(),
+                subject_key: "id".to_string(),
+            },
+        };
+        let oa_matching = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "shared_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Matching {
+                key: "owner".to_string(),
+                values: vec!["shared-owner".to_string()],
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa_relative.clone());
+        graph.add_oa(oa_matching.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_relative.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa_matching.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let req = ScopeRequest::new("read", "doc").subject_attrs(attrs(&[("id", &["user-1"])]));
+        if let AccessScope::Constrained(constraints) = scope(&graph, &req) {
+            assert_eq!(constraints.len(), 1);
+            let ScopeConstraint::Attribute { key, values } = &constraints[0];
+            assert_eq!(key, "owner");
+            assert!(values.contains(&"user-1".to_string()));
+            assert!(values.contains(&"shared-owner".to_string()));
+        } else {
+            panic!("Expected Constrained");
+        }
+    }
+
     // ---- AccessScope / ScopeConstraint derive tests (REQ-SCOPE-002) ----
 
     #[test]
@@ -4269,6 +4431,86 @@ mod invariant_tests {
             attrs(&[]),
         ];
         check_invariant(&graph, &subject, "read", "job", &resources);
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 6: Ownership via Relative OA
+    // ------------------------------------------------------------------
+
+    /// Builds an ownership graph: `All`-matcher UA directly associated with a
+    /// `Relative { resource_key: "owner", subject_key: "id" }` OA for "doc".
+    fn ownership_graph() -> (PolicyGraph, HashMap<String, HashSet<String>>) {
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "owned_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "owner".to_string(),
+                subject_key: "id".to_string(),
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        let subject = attrs(&[("id", &["user-1"])]);
+        (graph, subject)
+    }
+
+    /// Pattern 6a: ownership — subject has id values.
+    ///
+    /// Scope → `Constrained([owner ∈ ["user-1"]])`; docs owned by user-1 are
+    /// admitted, docs owned by others are denied — both sides agree.
+    #[test]
+    fn invariant_relative_oa_ownership() {
+        let (graph, subject) = ownership_graph();
+
+        let sreq = ScopeRequest::new("read", "doc").subject_attrs(subject.clone());
+        assert_eq!(
+            scope(&graph, &sreq),
+            AccessScope::Constrained(vec![ScopeConstraint::Attribute {
+                key: "owner".to_string(),
+                values: vec!["user-1".to_string()],
+            }])
+        );
+
+        let resources = [
+            attrs(&[("owner", &["user-1"])]),           // owned by subject
+            attrs(&[("owner", &["user-1", "user-2"])]), // co-owned (D18: user-1 present)
+            attrs(&[("owner", &["user-2"])]),           // owned by someone else
+            attrs(&[]),                                 // no owner key
+        ];
+        check_invariant(&graph, &subject, "read", "doc", &resources);
+    }
+
+    /// Pattern 6b: ownership — subject has no `id` key.
+    ///
+    /// Scope → `None` (fail-closed: no subject values → no constraint emitted);
+    /// every resource is denied — both sides agree.
+    #[test]
+    fn invariant_relative_oa_no_subject_values_returns_none() {
+        let (graph, _) = ownership_graph();
+        // Subject with a different key — no "id" present
+        let subject = attrs(&[("other", &["whatever"])]);
+
+        let sreq = ScopeRequest::new("read", "doc").subject_attrs(subject.clone());
+        assert_eq!(scope(&graph, &sreq), AccessScope::None);
+
+        let resources = [
+            attrs(&[("owner", &["user-1"])]),
+            attrs(&[("owner", &["user-2"])]),
+            attrs(&[]),
+        ];
+        check_invariant(&graph, &subject, "read", "doc", &resources);
     }
 }
 
