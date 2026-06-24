@@ -4185,18 +4185,24 @@ mod proptest_invariant_tests {
         #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
         /// For any generated graph, subject, and resource, `scope` admits the
         /// resource exactly when `evaluate` allows it.
+        ///
+        /// `req_operation`/`req_resource_type` are drawn independently from the
+        /// graph's so ~50% of cases test the operation-skip / resource_type-guard
+        /// branches where `evaluate` returns Deny and `scope` returns None.
         #[test]
         fn soundness_invariant_holds(
-            (graph, operation, resource_type) in arb_graph(),
+            (graph, ..) in arb_graph(),
+            req_operation in arb_operation(),
+            req_resource_type in arb_resource_type(),
             subject in arb_attr_map(),
             resource in arb_attr_map(),
         ) {
-            let sreq = ScopeRequest::new(&operation, &resource_type)
+            let sreq = ScopeRequest::new(&req_operation, &req_resource_type)
                 .subject_attrs(subject.clone());
             let s = scope(&graph, &sreq);
             let admitted = scope_admits(&s, &resource);
 
-            let areq = AccessRequest::new(&operation, &resource_type)
+            let areq = AccessRequest::new(&req_operation, &req_resource_type)
                 .subject_attrs(subject)
                 .resource_attrs(resource.clone());
             let allowed = evaluate(&graph, &areq) == Decision::Allow;
