@@ -107,6 +107,14 @@ pub enum AttributeMatcher {
     /// concrete `Matching`-equivalent constraint using the subject's current
     /// values for `subject_key`. When the subject has no values for
     /// `subject_key`, the matcher contributes nothing (fail-closed).
+    ///
+    /// **Note — self-referential use on `UserAttribute` nodes:** when this
+    /// matcher is attached to a `UserAttribute` (rather than an
+    /// `ObjectAttribute`), both `resource_key` and `subject_key` are resolved
+    /// against the *subject's* attribute map. The match condition becomes
+    /// `subject[resource_key] ∩ subject[subject_key] ≠ ∅`, which is useful for
+    /// expressing intra-subject co-membership constraints but has no
+    /// resource-side component.
     Relative {
         /// The attribute key looked up on the resource side.
         resource_key: String,
@@ -696,9 +704,11 @@ pub enum AccessScope {
 /// 4. For each `Matching { key, values }` or `Relative { resource_key, subject_key }`
 ///    matcher (in candidate-first-seen order), group by key and union the values
 ///    lists (deduplicating, preserving first-seen value order) →
-///    `ScopeConstraint::Attribute`. For `Relative`, subject values are resolved at
-///    request time and sorted for deterministic output; absent or empty subject
-///    values contribute nothing (fail-closed).
+///    `ScopeConstraint::Attribute`. For `Relative`, the resolved subject values
+///    within a single constraint are sorted (deterministic within that
+///    constraint); cross-constraint ordering across an `AccessScope` follows
+///    first-seen key order over HashMap iteration, same as the `Matching` path.
+///    Absent or empty subject values contribute nothing (fail-closed).
 /// 5. Return `Constrained(constraints)` if any constraints were collected,
 ///    otherwise `None`.
 ///
@@ -961,6 +971,18 @@ mod tests {
         let resource = attrs(&[("owner", &["user-1", "user-2"])]);
         let subject = attrs(&[("id", &["user-2", "user-3"])]);
         assert!(matcher.matches_resource(&resource, &subject));
+    }
+
+    #[test]
+    fn relative_matches_resource_empty_resource_set() {
+        // resource_key is present but maps to an empty set — fail-closed, expect false
+        let matcher = AttributeMatcher::Relative {
+            resource_key: "owner".to_string(),
+            subject_key: "id".to_string(),
+        };
+        let resource = attrs(&[("owner", &[])]);
+        let subject = attrs(&[("id", &["user-1"])]);
+        assert!(!matcher.matches_resource(&resource, &subject));
     }
 
     // --- D18 multi-valued intersection semantics tests ---
@@ -3286,6 +3308,54 @@ mod tests {
             .subject_attrs(attrs(&[("other", &["user-1"])]))
             .resource_attrs(attrs(&[("owner", &["user-1"])]));
         assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    #[test]
+    fn relative_evaluate_resource_key_absent() {
+        // resource_key absent from resource attrs — expect Deny (fail-closed)
+        let (graph, _) = relative_oa_graph();
+        let req = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("id", &["user-1"])]))
+            .resource_attrs(attrs(&[("other_key", &["user-1"])]));
+        assert_eq!(evaluate(&graph, &req), Decision::Deny);
+    }
+
+    #[test]
+    fn relative_same_key_overlapping_grants_non_overlapping_denies() {
+        // resource_key == subject_key: self-referential co-membership check.
+        // Both sides resolve to the same attribute on the subject map.
+        let mut graph = PolicyGraph::new();
+        let ua = UserAttribute {
+            id: Uuid::new_v4(),
+            name: "users".to_string(),
+            matcher: AttributeMatcher::All,
+        };
+        let oa = ObjectAttribute {
+            id: Uuid::new_v4(),
+            name: "team_docs".to_string(),
+            resource_type: "doc".to_string(),
+            matcher: AttributeMatcher::Relative {
+                resource_key: "team".to_string(),
+                subject_key: "team".to_string(),
+            },
+        };
+        graph.add_ua(ua.clone());
+        graph.add_oa(oa.clone());
+        graph.add_association(Association {
+            ua_id: ua.id,
+            target: AssociationTarget::ObjectAttribute(oa.id),
+            operations: HashSet::from(["read".to_string()]),
+        });
+        // Overlapping: resource team ∈ {a}, subject team ∈ {a, b} → Grant
+        let req_grant = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("team", &["a", "b"])]))
+            .resource_attrs(attrs(&[("team", &["a"])]));
+        assert_eq!(evaluate(&graph, &req_grant), Decision::Allow);
+        // Non-overlapping: resource team ∈ {c}, subject team ∈ {a, b} → Deny
+        let req_deny = AccessRequest::new("read", "doc")
+            .subject_attrs(attrs(&[("team", &["a", "b"])]))
+            .resource_attrs(attrs(&[("team", &["c"])]));
+        assert_eq!(evaluate(&graph, &req_deny), Decision::Deny);
     }
 
     #[test]
